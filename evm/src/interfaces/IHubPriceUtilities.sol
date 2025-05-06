@@ -9,17 +9,13 @@ import "../contracts/HubSpokeStructs.sol";
 
 interface IHubPriceUtilities {
     function getAssetRegistry() external view returns (IAssetRegistry);
-    function getPrices(address assetAddress) external view returns (uint256, uint256, uint256, uint256);
+    function getPrices(bytes32 asset) external view returns (uint256, uint256, uint256, uint256);
     function getVaultEffectiveNotionals(address vaultOwner, bool collateralizationRatios) external view returns (HubSpokeStructs.NotionalVaultAmount memory);
-    function calculateNotionals(address asset, HubSpokeStructs.DenormalizedVaultAmount memory vaultAmount) external view returns (HubSpokeStructs.NotionalVaultAmount memory);
-    function calculateEffectiveNotionals(address asset, HubSpokeStructs.DenormalizedVaultAmount memory vaultAmount) external view returns (HubSpokeStructs.NotionalVaultAmount memory);
-    function invertNotionals(address asset, HubSpokeStructs.NotionalVaultAmount memory realValues) external view returns (HubSpokeStructs.DenormalizedVaultAmount memory);
-    function applyCollateralizationRatios(address asset, HubSpokeStructs.NotionalVaultAmount memory vaultAmount) external view returns (HubSpokeStructs.NotionalVaultAmount memory);
-    function removeCollateralizationRatios(address asset, HubSpokeStructs.NotionalVaultAmount memory vaultAmount) external view returns (HubSpokeStructs.NotionalVaultAmount memory);
-    function checkAllowedToDeposit(address assetAddress, uint256 assetAmount, bool shouldRevert) external view returns (bool success, string memory error);
-    function checkAllowedToWithdraw(address vaultOwner, address assetAddress, uint256 assetAmount, bool shouldRevert) external view returns (bool success, string memory error);
-    function checkAllowedToBorrow(address vaultOwner, address assetAddress, uint256 assetAmount, bool shouldRevert) external view returns (bool success, string memory error);
-    function checkAllowedToRepay(address vaultOwner, address assetAddress, uint256 assetAmount, bool shouldRevert) external view returns (bool success, string memory error);
+    function calculateNotionals(bytes32 asset, HubSpokeStructs.DenormalizedVaultAmount memory vaultAmount) external view returns (HubSpokeStructs.NotionalVaultAmount memory);
+    function calculateEffectiveNotionals(bytes32 asset, HubSpokeStructs.DenormalizedVaultAmount memory vaultAmount) external view returns (HubSpokeStructs.NotionalVaultAmount memory);
+    function invertNotionals(bytes32 asset, HubSpokeStructs.NotionalVaultAmount memory realValues) external view returns (HubSpokeStructs.DenormalizedVaultAmount memory);
+    function applyCollateralizationRatios(bytes32 asset, HubSpokeStructs.NotionalVaultAmount memory vaultAmount) external view returns (HubSpokeStructs.NotionalVaultAmount memory);
+    function removeCollateralizationRatios(bytes32 asset, HubSpokeStructs.NotionalVaultAmount memory vaultAmount) external view returns (HubSpokeStructs.NotionalVaultAmount memory);
     function getHub() external view returns (IHub);
     function setHub(IHub _hub) external;
     function getPriceOracle() external view returns (ISynonymPriceOracle);

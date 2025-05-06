@@ -10,7 +10,7 @@ import "./BaseSynonymPriceSource.sol";
 contract ChainedPriceSource is BaseSynonymPriceSource {
     struct ChainedSource {
         ISynonymPriceSource source;
-        address inputAsset;
+        bytes32 inputAsset;
         string outputAsset;
         uint256 maxPriceAge;
     }
@@ -34,11 +34,11 @@ contract ChainedPriceSource is BaseSynonymPriceSource {
         }
     }
 
-    function priceAvailable(address _asset) public view override returns (bool) {
+    function priceAvailable(bytes32 _asset) public view override returns (bool) {
         return _asset == sources[0].inputAsset;
     }
 
-    function getPrice(address _asset, uint256 _maxPriceAge) external view override returns (Price memory price) {
+    function getPrice(bytes32 _asset, uint256 _maxPriceAge) external view override returns (Price memory price) {
         if (!priceAvailable(_asset)) {
             revert NoPriceForAsset();
         }

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {SynoBalancerPoolHelper, IBalancerPoolToken, IERC20} from "./SynoBalancerPoolHelper.sol";
+import {IVlSynoRewardsDistributor} from "../interfaces/rewards/IVlSynoRewardsDistributor.sol";
 
 /**
  * @title vlSYNO
  * @dev staking for balancer pool tokens with lock periods
  */
 contract vlSYNO is Initializable, OwnableUpgradeable {
+    using SynoBalancerPoolHelper for IBalancerPoolToken;
+
+    uint256 public constant UNSTAKE_COOLDOWN = 3 days;
+
     enum LockPeriod {
         ONE_MONTH,
         THREE_MONTHS,
@@ -27,15 +32,22 @@ contract vlSYNO is Initializable, OwnableUpgradeable {
     uint256 public totalSupply;
     mapping(address => uint256) public balanceOf;
 
-    address public poolToken;
+    IBalancerPoolToken public poolToken;
     mapping(address => Stake[]) public stakes;
+    uint256 public totalVlPower;
+    mapping(address => mapping(uint256 => bool)) public stakeExpirationHandled;
+    IVlSynoRewardsDistributor distributor;
 
     event Transfer(address indexed from, address indexed to, uint256 amount);
     event Staked(address indexed staker, uint256 indexed index, uint256 amount, LockPeriod lockPeriod);
     event Restaked(address indexed staker, uint256 indexed index, uint256 amount, LockPeriod lockPeriod);
     event UnstakeRequested(address indexed staker, uint256 indexed index);
     event Unstaked(address indexed staker, uint256 indexed index, uint256 amount);
+    event StakeExpired(address indexed staker, uint256 indexed index, uint256 amount);
+    event TotalVlPowerChanged(uint256 newTotal);
+    event RewardDistributorSet(address distributor);
 
+    error ExpirationAlreadyHandled();
     error StakeNotFound();
     error StakeLocked();
     error CooldownPeriod();
@@ -58,7 +70,33 @@ contract vlSYNO is Initializable, OwnableUpgradeable {
         if (_poolToken == address(0)) {
             revert InvalidInput();
         }
-        poolToken = _poolToken;
+        poolToken = IBalancerPoolToken(_poolToken);
+    }
+
+    function setTotalVlPower(uint256 _newTotal) external onlyOwner {
+        totalVlPower = _newTotal;
+    }
+
+    function setRewardDistributor(IVlSynoRewardsDistributor _distributor) public onlyOwner {
+        distributor = _distributor;
+        emit RewardDistributorSet(address(distributor));
+    }
+
+    /**
+     * @dev Allows a user to stake a certain amount of tokens for a specified lock period.
+     * @param amount The amount of tokens to stake.
+     * @param lockPeriod The lock period for the staked tokens.
+     * @param staker the address that we are staking on behalf of
+     */
+    function stake(uint256 amount, LockPeriod lockPeriod, address staker) public {
+        if (amount == 0) {
+            revert InvalidInput();
+        }
+
+        // stake
+        poolToken.transferFrom(msg.sender, address(this), amount);
+
+        _doStake(amount, lockPeriod, staker);
     }
 
     /**
@@ -67,20 +105,37 @@ contract vlSYNO is Initializable, OwnableUpgradeable {
      * @param lockPeriod The lock period for the staked tokens.
      */
     function stake(uint256 amount, LockPeriod lockPeriod) external {
-        if (amount == 0) {
-            revert InvalidInput();
-        }
+        stake(amount, lockPeriod, msg.sender);
+    }
 
-        // stake
-        IERC20(poolToken).transferFrom(msg.sender, address(this), amount);
-        stakes[msg.sender].push(Stake(amount, block.timestamp, lockPeriod, 0));
-        emit Staked(msg.sender, stakes[msg.sender].length - 1, amount, lockPeriod);
+    function _doStake(uint256 amount, LockPeriod lockPeriod, address staker) internal {
+        stakes[staker].push(Stake(amount, block.timestamp, lockPeriod, 0));
+        emit Staked(staker, stakes[staker].length - 1, amount, lockPeriod);
 
         // mint vlSYNO
         uint256 tokenAmount = amount;
-        totalSupply += tokenAmount;
-        balanceOf[msg.sender] += tokenAmount;
-        emit Transfer(address(0), msg.sender, tokenAmount);
+        _mint(staker, tokenAmount);
+
+        handleTotalVlPowerChange(getVlPowerOfStake(staker, stakes[staker].length - 1), 0);
+        if (address(distributor) != address(0)) {
+            distributor.handleVlSynoStakeChange(staker);
+        }
+    }
+
+    function zapAndStake(uint256 synoAmount, LockPeriod lockPeriod, address staker) public payable {
+        if (synoAmount == 0 && msg.value == 0) {
+            revert InvalidInput();
+        }
+
+        getSyno().transferFrom(msg.sender, address(this), synoAmount);
+
+        uint256 receivedBalancerLPTokens = poolToken._joinBalancerPool(synoAmount, msg.value);
+
+        _doStake(receivedBalancerLPTokens, lockPeriod, staker);
+    }
+
+    function zapAndStake(uint256 synoAmount, LockPeriod lockPeriod) public payable {
+        zapAndStake(synoAmount, lockPeriod, msg.sender);
     }
 
     /**
@@ -89,9 +144,19 @@ contract vlSYNO is Initializable, OwnableUpgradeable {
      */
     function requestUnstake(uint256 index) external {
         Stake storage _stake = stakes[msg.sender][index];
-        if (block.timestamp < _stake.timestamp + getLockPeriod(_stake.lockPeriod)) {
+        if (block.timestamp < getStakeExpirationTimestamp(msg.sender, index)) {
             revert StakeLocked();
         }
+
+        if (!stakeExpirationHandled[msg.sender][index]) {
+            stakeExpirationHandled[msg.sender][index] = true;
+            handleTotalVlPowerChange(0, getVlPowerOfStake(msg.sender, index));
+        }
+
+        if (address(distributor) != address(0)) {
+            distributor.handleVlSynoStakeChange(msg.sender);
+        }
+
         _stake.unstakeRequestTimestamp = block.timestamp;
         emit UnstakeRequested(msg.sender, index);
     }
@@ -103,42 +168,125 @@ contract vlSYNO is Initializable, OwnableUpgradeable {
     function unstake(uint256 index) external {
         // unstake
         Stake memory _stake = stakes[msg.sender][index];
+        uint256 tokenAmount = _stake.amount;
+
+        if (tokenAmount == 0) {
+            revert StakeNotFound();
+        }
 
         if(_stake.unstakeRequestTimestamp == 0) {
             revert RequestUnstakeNotCalled();
         }
 
-        if (block.timestamp < _stake.unstakeRequestTimestamp + 7 days) {
+        if (block.timestamp < _stake.unstakeRequestTimestamp + UNSTAKE_COOLDOWN) {
             revert CooldownPeriod();
         }
+
         delete stakes[msg.sender][index];
-        emit Unstaked(msg.sender, index, _stake.amount);
+        emit Unstaked(msg.sender, index, tokenAmount);
 
         // burn vlSYNO
-        uint256 tokenAmount = _stake.amount;
-        totalSupply -= tokenAmount;
-        balanceOf[msg.sender] -= tokenAmount;
-        IERC20(poolToken).transfer(msg.sender, _stake.amount);
-        emit Transfer(msg.sender, address(0), tokenAmount);
+        _burn(msg.sender, tokenAmount);
+
+        poolToken.transfer(msg.sender, tokenAmount);
     }
 
     /**
      * @dev Allows a user to restake their tokens.
      * @param index The index of the stake in the user's stake array.
+     * @param lockPeriod The index of the stake in the user's stake array.
+     * @param extraAmount amount of BLP tokens to be added to the existing stake.
      */
-    function restake(uint256 index) external {
+    function restake(uint256 index, LockPeriod lockPeriod, uint256 extraAmount, bool transferPoolToken) private {
         Stake storage _stake = stakes[msg.sender][index];
         if (_stake.amount == 0) {
             revert StakeNotFound();
         }
 
-        if (block.timestamp < _stake.timestamp + getLockPeriod(_stake.lockPeriod)) {
+        uint256 vlPowerToSubtract = 0;
+        if (!stakeExpirationHandled[msg.sender][index]) {
+            // the expiration hasn't been handled before so this stake's power is still in the total
+            vlPowerToSubtract = getVlPowerOfStake(msg.sender, index);
+        }
+
+        // New lock period ends before the old lock period would
+        if (block.timestamp + getLockPeriod(lockPeriod) < getStakeExpirationTimestamp(msg.sender, index)) {
             revert StakeLocked();
+        }
+
+        if(extraAmount > 0) {
+            // This is required for zap and restake, as there will be no transfer of pool token.
+            if(transferPoolToken) {
+                poolToken.transferFrom(msg.sender, address(this), extraAmount);
+            }
+
+            _stake.amount += extraAmount;
+            _mint(msg.sender, extraAmount);
         }
 
         _stake.timestamp = block.timestamp;
         _stake.unstakeRequestTimestamp = 0;
+        _stake.lockPeriod = lockPeriod;
+        stakeExpirationHandled[msg.sender][index] = false;
+
+        handleTotalVlPowerChange(getVlPowerOfStake(msg.sender, index), vlPowerToSubtract);
+        if (address(distributor) != address(0)) {
+            distributor.handleVlSynoStakeChange(msg.sender);
+        }
+
         emit Restaked(msg.sender, index, _stake.amount, _stake.lockPeriod);
+    }
+
+    function restake(uint256 index, LockPeriod lockPeriod, uint256 extraAmount) public {
+        restake(index, lockPeriod, extraAmount, true);
+    }
+
+    function restake(uint256 index, LockPeriod lockPeriod) public {
+        restake(index, lockPeriod, 0);
+    }
+
+    function restake(uint256 index) public {
+        Stake storage _stake = stakes[msg.sender][index];
+        restake(index, _stake.lockPeriod);
+    }
+
+    function zapAndRestake(uint256 synoAmount, uint256 index, LockPeriod lockPeriod) public payable {
+        if(synoAmount != 0) {
+
+            getSyno().transferFrom(msg.sender, address(this), synoAmount);
+        }
+
+        uint256 receivedBalancerLPTokens = 0;
+
+        if (synoAmount != 0 || msg.value != 0) {
+            receivedBalancerLPTokens = poolToken._joinBalancerPool(synoAmount, msg.value);
+        }
+
+        restake(index, lockPeriod, receivedBalancerLPTokens, false);
+    }
+
+    function handleExpiredStake(address _user, uint256 _index) public {
+        if (_index >= stakes[_user].length || stakes[_user][_index].amount == 0) {
+            revert StakeNotFound();
+        }
+
+        if (block.timestamp < getStakeExpirationTimestamp(_user, _index)) {
+            revert StakeLocked();
+        }
+
+        if (stakeExpirationHandled[_user][_index]) {
+            revert ExpirationAlreadyHandled();
+        }
+
+        stakeExpirationHandled[_user][_index] = true;
+
+        handleTotalVlPowerChange(0, getVlPowerOfStake(_user, _index));
+
+        if (address(distributor) != address(0)) {
+            distributor.handleVlSynoStakeChange(_user);
+        }
+
+        emit StakeExpired(_user, _index, stakes[_user][_index].amount);
     }
 
     /**
@@ -148,14 +296,40 @@ contract vlSYNO is Initializable, OwnableUpgradeable {
      */
     function vlPower(address owner) external view returns (uint256 power) {
         for (uint256 i = 0; i < stakes[owner].length; i++) {
-            Stake memory _stake = stakes[msg.sender][i];
-            if (block.timestamp < _stake.timestamp + getLockPeriod(_stake.lockPeriod)) {
-                power += _stake.amount * getLockPeriodMultiplier(_stake.lockPeriod);
+            if (!isStakeExpired(owner, i)) {
+                power += getVlPowerOfStake(owner, i);
             }
+
         }
     }
 
+    /**
+     * @dev returns the nominal vlPower of the Stake (even if Stake is expired)
+     */
+    function getVlPowerOfStake(address _staker, uint256 _index) public view returns (uint256) {
+        Stake storage _stake = stakes[_staker][_index];
+        return _stake.amount * getLockPeriodMultiplier(_stake.lockPeriod);
+    }
+
+    // no need for the modifier here, because getStakeExpirationTimestamp will check it
+    function isStakeExpired(address _staker, uint256 _stakeId) public view returns (bool) {
+        return block.timestamp >= getStakeExpirationTimestamp(_staker, _stakeId);
+    }
+
+    function getStakeExpirationTimestamp(address _staker, uint256 _stakeId) public view returns (uint256) {
+        Stake storage _stake = stakes[_staker][_stakeId];
+        return _stake.timestamp + getLockPeriod(_stake.lockPeriod);
+    }
+
     // INTERNAL FUNCTIONS
+
+    function handleTotalVlPowerChange(uint256 addedVlPower, uint256 subtractedVlPower) internal {
+        if (totalVlPower + addedVlPower < subtractedVlPower) {
+            revert InvalidInput();
+        }
+        totalVlPower = totalVlPower + addedVlPower - subtractedVlPower;
+        emit TotalVlPowerChanged(totalVlPower);
+    }
 
     /**
      * @dev Returns the lock period in days based on the provided LockPeriod enum value.
@@ -189,5 +363,22 @@ contract vlSYNO is Initializable, OwnableUpgradeable {
         }
 
         return 25; // lockPeriod == LockPeriod.TWELVE_MONTHS
+    }
+
+    function getSyno() public view returns (IERC20) {
+        (,,IERC20[] memory tokens,,uint256 synoIndex,) = poolToken._getPoolInfo();
+        return tokens[synoIndex];
+    }
+
+    function _mint(address staker, uint256 amount) internal {
+        totalSupply += amount;
+        balanceOf[staker] += amount;
+        emit Transfer(address(0), msg.sender, amount);
+    }
+
+    function _burn(address staker, uint256 amount) internal {
+        totalSupply -= amount;
+        balanceOf[staker] -= amount;
+        emit Transfer(msg.sender, address(0), amount);
     }
 }

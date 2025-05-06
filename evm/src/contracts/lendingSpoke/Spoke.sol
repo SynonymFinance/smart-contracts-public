@@ -1,18 +1,26 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
-import {TokenSender} from "@wormhole-upgradeable/WormholeRelayerSDK.sol";
-import {CCTPSender, CCTPBase} from "@wormhole-upgradeable/CCTPBase.sol";
-import {VaaKey} from "@wormhole-upgradeable/interfaces/IWormholeRelayer.sol";
-import "@wormhole-upgradeable/Utils.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IWETH} from "@wormhole/interfaces/IWETH.sol";
+
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ISpoke} from "../../interfaces/ISpoke.sol";
+import {IHub} from "../../interfaces/IHub.sol";
+import {IWormholeTunnel} from "../../interfaces/IWormholeTunnel.sol";
 
-import "../HubSpokeStructs.sol";
-import "./SpokeGetters.sol";
-import "../wormhole/TokenReceiverWithCCTP.sol";
-import "../wormhole/TokenBridgeUtilities.sol";
+import {HubSpokeStructs} from "../HubSpokeStructs.sol";
+import {HubSpokeEvents} from "../HubSpokeEvents.sol";
+
+import {TunnelMessageBuilder} from "../wormhole/TunnelMessageBuilder.sol";
+import {SpokeOptimisticFinalityLogic} from "../../libraries/logic/optimisticFinality/SpokeOptimisticFinalityLogic.sol";
+import {CommonAccountingLogic} from "../../libraries/logic/accounting/CommonAccountingLogic.sol";
+import {SpokeAccountingLogic} from "../../libraries/logic/accounting/SpokeAccountingLogic.sol";
+
+import "@wormhole/Utils.sol";
 
 /**
  * @title Spoke
@@ -23,49 +31,50 @@ import "../wormhole/TokenBridgeUtilities.sol";
  * contract also implements wormhole's CCTP contracts to send/receive USDC.
  */
 
-contract Spoke is SpokeGetters, TokenSender, CCTPSender, TokenReceiverWithCCTP, Ownable {
+contract Spoke is ISpoke, Initializable, OwnableUpgradeable, PausableUpgradeable, HubSpokeEvents {
     using SafeERC20 for IERC20;
+    using SpokeOptimisticFinalityLogic for HubSpokeStructs.SpokeOptimisticFinalityState;
+
+    HubSpokeStructs.SpokeCommunicationState commState;
+    HubSpokeStructs.SpokeOptimisticFinalityState ofState;
+    IWETH public weth;
+
+    modifier onlyWormholeTunnel() {
+        if (msg.sender != address(commState.wormholeTunnel)) {
+            revert OnlyWormholeTunnel();
+        }
+        _;
+    }
+
+    modifier onlyHubSender(IWormholeTunnel.MessageSource calldata source) {
+        if (source.sender != commState.hubContractAddress || source.chainId != commState.hubChainId) {
+            revert OnlyHubSender();
+        }
+        _;
+    }
 
     /**
-     * @notice Spoke constructor - Initializes a new spoke with given parameters
-     *
-     * @param chainId: Chain ID of the chain that this Spoke is deployed on
-     * @param wormhole: Address of the Wormhole contract on this Spoke chain
-     * @param tokenBridge: Address of the TokenBridge contract on this Spoke chain
-     * @param relayer: Address of the WormholeRelayer contract on this Spoke chain
-     * @param hubChainId: Chain ID of the Hub
-     * @param hubContractAddress: Contract address of the Hub contract (on the Hub chain)
-     * @param _circleMessageTransmitter: Cicle Message Transmitter contract (cctp)
-     * @param _circleTokenMessenger: Cicle Token Messenger contract (cctp)
-     * @param _USDC: USDC token contract (cctp)
+     * @notice Spoke initializer - Initializes a new spoke with given parameters
+     * @param _hubChainId: Chain ID of the Hub
+     * @param _hubContractAddress: Contract address of the Hub contract (on the Hub chain)
+     * @param _tunnel: The Wormhole tunnel contract
      */
-    constructor(
-        uint16 chainId,
-        address wormhole,
-        address tokenBridge,
-        address relayer,
-        uint16 hubChainId,
-        address hubContractAddress,
-        address _circleMessageTransmitter,
-        address _circleTokenMessenger,
-        address _USDC
-    ) Ownable(msg.sender) {
-        CCTPBase.__CCTPBase_init(
-            relayer,
-            tokenBridge,
-            wormhole,
-            _circleMessageTransmitter,
-            _circleTokenMessenger,
-            _USDC
-        );
-        _state.chainId = chainId;
-        _state.hubChainId = hubChainId;
-        _state.hubContractAddress = hubContractAddress;
-        _state.defaultGasLimitRoundtrip = 650_000;
-        _state.isUsingCCTP = _circleMessageTransmitter != address(0); // zero address would indicate not using/supported
-        setRegisteredSender(hubChainId, toWormholeFormat(hubContractAddress));
-        // disable the registrationOwner so that the Hub can't be changed.
-        registrationOwner = address(0);
+    function initialize(
+        uint16 _hubChainId,
+        address _hubContractAddress,
+        IWormholeTunnel _tunnel,
+        IWETH _weth
+    ) public initializer {
+        OwnableUpgradeable.__Ownable_init(msg.sender);
+        PausableUpgradeable.__Pausable_init();
+        commState.hubChainId = _hubChainId;
+        commState.hubContractAddress = toWormholeFormat(_hubContractAddress);
+        commState.wormholeTunnel = _tunnel;
+        commState.defaultGasLimitRoundtrip = 5_000_000;
+
+        ofState.avgTransactionsPerTopUp = 10;
+
+        weth = _weth;
     }
 
     /**
@@ -74,461 +83,248 @@ contract Spoke is SpokeGetters, TokenSender, CCTPSender, TokenReceiverWithCCTP, 
      * @param value: the new value for `defaultGasLimitRoundtrip`
      */
     function setDefaultGasLimitRoundtrip(uint256 value) external onlyOwner {
-        _state.defaultGasLimitRoundtrip = value;
+        commState.defaultGasLimitRoundtrip = value;
+    }
+
+    function getCommState() public view returns (HubSpokeStructs.SpokeCommunicationState memory) {
+        return commState;
+    }
+
+    function setLimits(address _token, uint256 _creditLimit, uint256 _custodyLimit, uint256 _transactionLimit) external onlyOwner {
+        ofState.setLimits(_token, _creditLimit, _custodyLimit, _transactionLimit);
+    }
+
+    function getSpokeBalances(address _token) external view returns (HubSpokeStructs.SpokeBalances memory) {
+        return ofState.tokenBalances[toWormholeFormat(_token)];
+    }
+
+    function getCredit(address _user, uint256 _nonce) external view returns (HubSpokeStructs.Credit memory) {
+        return ofState.storedCredits[_user][_nonce];
+    }
+
+    function getInstantMessageFee(HubSpokeStructs.ActionDirection _direction) external view returns (uint256) {
+        return _direction == HubSpokeStructs.ActionDirection.Inbound ? ofState.inboundTokenInstantMessageFee : ofState.outboundTokenInstantMessageFee;
+    }
+
+    function getLastUserActionNonce(address _user) external view returns (uint256) {
+        return ofState.lastInstantActionNonces[_user];
+    }
+
+    // getter for backward compatibility
+    function defaultGasLimitRoundtrip() external view returns (uint256) {
+        return commState.defaultGasLimitRoundtrip;
+    }
+
+    function setInstantMessageFees(uint256 _inboundTokenInstantMessageFee, uint256 _outboundTokenInstantMessageFee) external onlyOwner {
+        ofState.setInstantMessageFees(_inboundTokenInstantMessageFee, _outboundTokenInstantMessageFee);
+    }
+
+    function setHub(uint16 _hubChainId, address _hubContractAddress) external onlyOwner {
+        commState.hubChainId = _hubChainId;
+        commState.hubContractAddress = toWormholeFormat(_hubContractAddress);
+    }
+
+    function setWormholeTunnel(IWormholeTunnel _tunnel) external onlyOwner {
+        commState.wormholeTunnel = _tunnel;
+    }
+
+    function _checkAndConvertNativeOutboundAsset(HubSpokeStructs.Action action, IERC20 asset) internal view returns (IERC20) {
+        if (action == HubSpokeStructs.Action.BorrowNative || action == HubSpokeStructs.Action.WithdrawNative) {
+            if (address(asset) != address(0)) {
+                revert UnusedParameterMustBeZero();
+            }
+            asset = IERC20(address(weth));
+        }
+        return asset;
+    }
+
+    function userActions(HubSpokeStructs.Action action, IERC20 asset, uint256 amount, uint256 costForReturnDelivery) external payable {
+        asset = _checkAndConvertNativeOutboundAsset(action, asset);
+        if (!_isTokenSend(action)) {
+            // withdrawals and borrows are redirected to the OF flow by default
+            uint256[] memory returnCosts = new uint256[](1);
+            returnCosts[0] = costForReturnDelivery;
+            SpokeOptimisticFinalityLogic.handleInstantAction(ofState, commState, weth, action, address(asset), amount, returnCosts);
+            return;
+        }
+
+        // from this point the action is guaranteed to be a full finality deposit or repay (+native)
+        if (costForReturnDelivery > 0) {
+            // there is no return delivery, because the funds are custodied by the Spoke
+            revert InvalidDeliveryCost();
+        }
+
+        uint256 totalCost = getFullFinalityDepositRepayCost();
+        if (msg.value < totalCost) {
+            revert InsufficientMsgValue();
+        }
+        uint256 valueToSend = msg.value;
+        address assetAddress = address(asset);
+        // this remaps the action, asset and amount in case of native transfers
+        (action, assetAddress, amount, valueToSend) = CommonAccountingLogic.handleInboundTokensAndAdjustAction(action, assetAddress, amount, weth, totalCost);
+
+        HubSpokeStructs.SpokeBalances storage balances = ofState.tokenBalances[toWormholeFormat(assetAddress)];
+        if (balances.deposits + amount > balances.custodyLimit) {
+            revert CustodyLimitExceeded();
+        }
+        balances.deposits += amount;
+
+        if (amount == 0) {
+            revert InvalidAmount();
+        }
+
+        IWormholeTunnel.TunnelMessage memory message;
+
+        message.source.refundRecipient = toWormholeFormat(msg.sender);
+        message.source.sender = toWormholeFormat(address(this));
+
+        message.target.chainId = commState.hubChainId;
+        message.target.recipient = commState.hubContractAddress;
+        message.target.selector = IHub.userActionMessage.selector;
+        message.target.payload = abi.encode(HubSpokeStructs.UserActionPayload({
+            user: toWormholeFormat(msg.sender),
+            action: action,
+            token: toWormholeFormat(address(assetAddress)),
+            amount: amount,
+            nonce: 0 // nonce is unused in full finality message flow
+        }));
+
+        commState.wormholeTunnel.sendEvmMessage{value: valueToSend}(
+            message,
+            commState.defaultGasLimitRoundtrip
+        );
+    }
+
+    function instantActions(
+        HubSpokeStructs.Action action,
+        IERC20 asset,
+        uint256 amount,
+        uint256[] calldata costForReturnDelivery
+    )  external payable {
+        asset = _checkAndConvertNativeOutboundAsset(action, asset);
+        SpokeOptimisticFinalityLogic.handleInstantAction(ofState, commState, weth, action, address(asset), amount, costForReturnDelivery);
+    }
+
+    function requestPairing(bytes32 userId) external payable {
+        SpokeAccountingLogic.handlePairingRequest(commState, userId);
+    }
+
+    function getPairingCost() public view returns (uint256) {
+        return SpokeAccountingLogic.getPairingCost(commState);
     }
 
     /**
-     * @notice Allows the contract deployer to toggle whether we are using CCTP for USDC
-     * NOTE: If `_circleMessageTransmitter` is the null address, it indicates CCTP is not supported on this chain, thus
-     * we don't do anything.
+     * @notice Get the quote for the wormhole delivery cost of a full finality deposit/repay message
      *
-     * @param value: the new value for `isUsingCCTP`
-     */
-    function setIsUsingCCTP(bool value) external onlyOwner {
-        if (address(circleMessageTransmitter) == address(0)) return; // zero address would indicate not using/supported
-
-        _state.isUsingCCTP = value;
-    }
-
-    /**
-     * @notice Allows the caller to initiate a cross-chain deposit. The caller must have approved the `assetAmount` of
-     * `asset` and must have provided enough `msg.value` to cover the relay
+     * @return cost for delivering a full finality deposit/repay message to the Hub
      *
-     * @param asset: Addresss of the asset to deposit
-     * @param assetAmount: Amount of the asset to deposit
-     * @param costForReturnDelivery: The quoted cost for return delivery from the Hub (for refunds)
-     * @return sequence number of the message sent.
      */
-    function depositCollateral(address asset, uint256 assetAmount, uint256 costForReturnDelivery)
-        public
-        payable
-        returns (uint64 sequence)
-    {
-        require(msg.value >= getDeliveryCostRoundtrip(costForReturnDelivery, true), "Insufficient value sent");
-        sequence = _doAction(HubSpokeStructs.Action.Deposit, asset, assetAmount, costForReturnDelivery, false);
-    }
-
-    /**
-     * @notice Allows the caller to initiate a cross-chain withdraw. The caller must have provided enough `msg.value`
-     * to cover the relay and the return delivery
-     *
-     * @param asset: Addresss of the asset to withdraw
-     * @param assetAmount: Amount of the asset to withdraw
-     * @param costForReturnDelivery: The quoted cost for return delivery from the Hub
-     * @return sequence number of the message sent.
-     */
-    function withdrawCollateral(address asset, uint256 assetAmount, uint256 costForReturnDelivery)
-        public
-        payable
-        returns (uint64 sequence)
-    {
-        require(costForReturnDelivery > 0, "Non-zero costForReturnDelivery");
-        sequence = _doAction(HubSpokeStructs.Action.Withdraw, asset, assetAmount, costForReturnDelivery, false);
-    }
-
-    /**
-     * @notice Allows the caller to initiate a cross-chain borrow. The caller must have provided enough `msg.value`
-     * to cover the relay and the return delivery
-     *
-     * @param asset: Addresss of the asset to borrow
-     * @param assetAmount: Amount of the asset to borrow
-     * @param costForReturnDelivery: The quoted cost for return delivery from the Hub
-     * @return sequence number of the message sent.
-     */
-    function borrow(address asset, uint256 assetAmount, uint256 costForReturnDelivery)
-        public
-        payable
-        returns (uint64 sequence)
-    {
-        require(costForReturnDelivery > 0, "Non-zero costForReturnDelivery");
-        sequence = _doAction(HubSpokeStructs.Action.Borrow, asset, assetAmount, costForReturnDelivery, false);
-    }
-
-    /**
-     * @notice Allows the caller to initiate a cross-chain repay. The caller must have approved the `assetAmount` of
-     * `asset` and must have provided enough `msg.value` to cover the relay
-     *
-     * @param asset: Addresss of the asset to borrow
-     * @param assetAmount: Amount of the asset to borrow
-     * @param costForReturnDelivery: The quoted cost for return delivery from the Hub (for refunds)
-     * @return sequence number of the message sent.
-     */
-    function repay(address asset, uint256 assetAmount, uint256 costForReturnDelivery)
-        public
-        payable
-        returns (uint64 sequence)
-    {
-        require(msg.value >= getDeliveryCostRoundtrip(costForReturnDelivery, true), "Insufficient value sent");
-        sequence = _doAction(HubSpokeStructs.Action.Repay, asset, assetAmount, costForReturnDelivery, false);
-    }
-
-    /**
-     * @notice Allows the caller to initiate a cross-chain deposit with native tokens. The caller must have provided
-     * enough `msg.value` to cover the relay+return and their desired deposit amount
-     * @param costForReturnDelivery: The quoted cost for return delivery from the Hub (for refunds)
-     * enough `msg.value` to cover the relay and their desired deposit amount
-     * @return sequence number of the message sent.
-     */
-    function depositCollateralNative(uint256 costForReturnDelivery) public payable returns (uint64 sequence) {
-        uint256 totalCost = getDeliveryCostRoundtrip(costForReturnDelivery, true);
-        require(msg.value >= totalCost, "Spoke::depositCollateralNative:Insufficient value sent");
-        uint256 amount = msg.value - totalCost;
-
-        sequence = _doAction(HubSpokeStructs.Action.DepositNative, address(0), amount, costForReturnDelivery, false);
-    }
-
-    /**
-     * @notice Allows the caller to initiate a cross-chain repay with native tokens. The caller must have provided
-     * enough `msg.value` to cover the relay+return and their desired repay amount
-     * @param costForReturnDelivery: The quoted cost for return delivery from the Hub (for refunds)
-     * enough `msg.value` to cover the relay and their desired repay amount
-     * @return sequence number of the message sent.
-     */
-    function repayNative(uint256 costForReturnDelivery) public payable returns (uint64 sequence) {
-        uint256 totalCost = getDeliveryCostRoundtrip(costForReturnDelivery, true);
-        require(msg.value >= totalCost, "Spoke::repayNative:Insufficient value sent");
-        uint256 amount = msg.value - totalCost;
-
-        sequence = _doAction(HubSpokeStructs.Action.RepayNative, address(0), amount, costForReturnDelivery, false);
-    }
-
-    /**
-     * @notice Allows the caller to initiate a cross-chain withdraw with native tokens. The caller must have provided
-     * enough `msg.value` to cover the relay and the return delivery
-     *
-     * @param assetAmount: Amount of the asset to withdraw
-     * @param costForReturnDelivery: The quoted cost for return delivery from the Hub
-     * @param unwrap: Whether to unwrap the native tokens or not
-     * @return sequence number of the message sent.
-     */
-    function withdrawCollateralNative(uint256 assetAmount, uint256 costForReturnDelivery, bool unwrap)
-        public
-        payable
-        returns (uint64 sequence)
-    {
-        sequence = _doAction(HubSpokeStructs.Action.Withdraw, address(tokenBridge.WETH()), assetAmount, costForReturnDelivery, unwrap);
-    }
-
-    /**
-     * @notice Allows the caller to initiate a cross-chain borrow with native tokens. The caller must have provided
-     * enough `msg.value` to cover the relay and the return delivery
-     *
-     * @param assetAmount: Amount of the asset to borrow
-     * @param costForReturnDelivery: The quoted cost for return delivery from the Hub
-     * @param unwrap: Whether to unwrap the native tokens or not
-     * @return sequence number of the message sent.
-     */
-    function borrowNative(uint256 assetAmount, uint256 costForReturnDelivery, bool unwrap)
-        public
-        payable
-        returns (uint64 sequence)
-    {
-        sequence = _doAction(HubSpokeStructs.Action.Borrow, address(tokenBridge.WETH()), assetAmount, costForReturnDelivery, unwrap);
-    }
-
-    /**
-     * @notice Get the quote for the wormhole delivery cost, accounting for a forward() call on the Hub (in case of potential
-     * reverts or to receive tokens on borrow/withdraw)
-     *
-     * @param costForReturnDelivery: the result of Hub#getCostForReturnDelivery()
-     * @param withTokenTransfer: whether to include the message fee for a token bridge transfer (on deposit or repay)
-     * @return cost for the forward() call on the Hub
-     */
-    function getDeliveryCostRoundtrip(uint256 costForReturnDelivery, bool withTokenTransfer)
+    function getFullFinalityDepositRepayCost()
         public
         view
         returns (uint256)
     {
-        (uint256 cost,) =
-            wormholeRelayer.quoteEVMDeliveryPrice(hubChainId(), costForReturnDelivery, defaultGasLimitRoundtrip());
-
-        if (withTokenTransfer) {
-            return cost + tokenBridge.wormhole().messageFee();
-        }
-
-        return cost;
-    }
-
-    /**
-     * @dev Initiates an action (deposit, borrow, withdraw, or repay) on the spoke by sending
-     * a Wormhole message (potentially a TokenBridge message with tokens) to the Hub
-     * @param action - the action to be performed. It can be Deposit, Borrow, Withdraw, Repay, DepositNative, RepayNative.
-     * @param asset - the address of the relevant asset. For native tokens like ETH, AVAX, this will be the zero address.
-     * @param assetAmount - the amount of the asset to be involved in the action.
-     * @param costForReturnDelivery - the cost to forward tokens back from the Hub
-     * @param unwrap - a boolean value indicating whether to unwrap the asset or not.
-     * @return sequence number of the message sent.
-     */
-    function _doAction(HubSpokeStructs.Action action, address asset, uint256 assetAmount, uint256 costForReturnDelivery, bool unwrap)
-        internal
-        returns (uint64 sequence)
-    {
-
-        require(assetAmount > 0, "No zero asset amount");
-
-        bool withCCTP = asset == USDC && _state.isUsingCCTP;
-
-        // for token transfers, only validate amount if we're using the token bridge
-        if (!withCCTP) {
-            TokenBridgeUtilities.requireAssetAmountValidForTokenBridge(asset, assetAmount);
-        }
-
-        HubSpokeStructs.Action hubAction = action;
-
-        if (action == HubSpokeStructs.Action.DepositNative) {
-            hubAction = HubSpokeStructs.Action.Deposit;
-        } else if (action == HubSpokeStructs.Action.RepayNative) {
-            hubAction = HubSpokeStructs.Action.Repay;
-        }
-
-        bool sendingTokens = action == HubSpokeStructs.Action.Deposit || action == HubSpokeStructs.Action.Repay;
-        bool sendingUSDC = withCCTP && sendingTokens;
-        bool receivingUSDC = withCCTP && !sendingTokens;
-        bytes memory userPayload = abi.encode(uint8(hubAction), msg.sender, asset, unwrap, sendingUSDC, receivingUSDC);
-        bytes memory payload = sendingUSDC
-            ? userPayload
-            : abi.encode(assetAmount, userPayload); // encoding again so it's the same format as cctp messages
-
-        if (sendingTokens) {
-            sequence = withCCTP
-                ? _sendUSDCWithPayload(payload, assetAmount, costForReturnDelivery)
-                : _sendTokenBridgeMessage(payload, asset, assetAmount, costForReturnDelivery);
-        } else if (action == HubSpokeStructs.Action.Withdraw || action == HubSpokeStructs.Action.Borrow) {
-            sequence = wormholeRelayer.sendPayloadToEvm{value: msg.value}(
-                hubChainId(),
-                hubContractAddress(),
-                payload,
-                costForReturnDelivery,
-                defaultGasLimitRoundtrip(),
-                chainId(), // refundChain
-                msg.sender // refundAddress
-            );
-        } else if (action == HubSpokeStructs.Action.DepositNative || action == HubSpokeStructs.Action.RepayNative) {
-            sequence = _sendTokenBridgeMessageNative(payload, assetAmount, costForReturnDelivery);
-        }
-    }
-
-    /**
-     * @dev Sends EVM Worlhole Relayer a message with the given payload and value
-     * @param value - amount of ETH to be sent to relayer
-     * @param payload - the payload to be sent
-     * @param costForReturnDelivery - the cost to forward tokens back from the Hub
-     * @param refundAddress The address on `refundChain` to deliver any refund to
-     * @return sequence - the sequence number of the message sent
-     */
-    function _sendToEvmWormHoleRelayer(
-        uint256 value,
-        bytes memory payload,
-        uint256 costForReturnDelivery,
-        address refundAddress
-    ) internal returns(uint64 sequence) {
-        return wormholeRelayer.sendPayloadToEvm{value: value}(
-            hubChainId(),
-            hubContractAddress(),
-            payload,
-            costForReturnDelivery,
-            defaultGasLimitRoundtrip(),
-            hubChainId(),
-            refundAddress
+        return commState.wormholeTunnel.getMessageCost(
+            commState.hubChainId,
+            commState.defaultGasLimitRoundtrip,
+            0, // since introducing unified liquidity the return cost is always zero
+            false // since introducing unified liquidity no tokens are being transferred through TokenBridge
         );
     }
 
-    /**
-     * @dev Sends a TokenBridge message with the given payload, asset, and amount
-     * @param payload - the payload to be sent
-     * @param asset - the address of the asset to be sent
-     * @param amount - the amount of the asset to be sent
-     * @param costForReturnDelivery - the cost to forward tokens back from the Hub
-     * @return sequence - the sequence number of the message sent
-     */
-    function _sendTokenBridgeMessage(bytes memory payload, address asset, uint256 amount, uint256 costForReturnDelivery)
-        internal
-        returns (uint64)
-    {
-        IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
-
-        return sendTokenWithPayloadToEvm(
-            hubChainId(),
-            hubContractAddress(),
-            payload,
-            costForReturnDelivery,
-            defaultGasLimitRoundtrip(),
-            asset,
-            amount,
-            chainId(), // refundChain
-            msg.sender // refundAddress
-        );
+    function getInstantActionDeliveryCosts(HubSpokeStructs.Action, uint256[] calldata returnCosts) public view returns (uint256 total, uint256[] memory costs) {
+        return SpokeOptimisticFinalityLogic.getInstantActionDeliveryCosts(commState, returnCosts);
     }
 
-    /**
-     * @dev Sends a TokenBridge message with the given payload and amount in native tokens
-     * @param payload - the payload to be sent
-     * @param amount - the amount of native tokens to be sent
-     * @param costForReturnDelivery - the cost to forward tokens back from the Hub
-     * @return sequence - the sequence number of the message sent
-     */
-    function _sendTokenBridgeMessageNative(bytes memory payload, uint256 amount, uint256 costForReturnDelivery)
-        internal
-        returns (uint64)
-    {
-        uint256 amountPlusFee = amount + tokenBridge.wormhole().messageFee();
-        uint64 sequence = tokenBridge.wrapAndTransferETHWithPayload{value: amountPlusFee}(
-            hubChainId(), toWormholeFormat(hubContractAddress()), 0, payload
-        );
-
-        VaaKey[] memory additionalVaas = new VaaKey[](1);
-        additionalVaas[0] = VaaKey(chainId(), toWormholeFormat(address(tokenBridge)), sequence);
-
-        uint256 deliveryCost = getDeliveryCostRoundtrip(costForReturnDelivery, false);
-        return wormholeRelayer.sendVaasToEvm{value: deliveryCost}(
-            hubChainId(),
-            hubContractAddress(),
-            payload,
-            costForReturnDelivery,
-            defaultGasLimitRoundtrip(),
-            additionalVaas,
-            chainId(), // refundChain
-            msg.sender // refundAddress
-        );
+    function getReserveAmount(address asset) public view returns (uint256) {
+        return SpokeAccountingLogic.getReserveAmount(ofState, asset);
     }
 
-    /**
-     * @dev Sends USDC with the given payload via wormhole's CCTP integration
-     * @param payload - the payload to be sent
-     * @param amount - the amount of the asset to be sent
-     * @param costForReturnDelivery - the cost to forward tokens back from the Hub
-     * @return sequence - the sequence number of the message sent
-     */
-    function _sendUSDCWithPayload(bytes memory payload, uint256 amount, uint256 costForReturnDelivery)
-        internal
-        returns (uint64)
-    {
-        IERC20(USDC).safeTransferFrom(msg.sender, address(this), amount);
-
-        return sendUSDCWithPayloadToEvm(
-            hubChainId(),
-            hubContractAddress(),
-            payload,
-            costForReturnDelivery,
-            defaultGasLimitRoundtrip(),
-            amount,
-            chainId(), // refundChain
-            msg.sender // refundAddress
-        );
+    // local reserves withdrawal
+    function withdrawReserves(address asset, uint256 amount, address recipient) external onlyOwner {
+        SpokeAccountingLogic.withdrawReserves(ofState, asset, amount, recipient);
     }
 
-    /**
-     * @dev Returns whether we are using CCTP while receiving wormhole messages, as specified in the encoded `payload`
-     * @param payload - the payload received
-     */
-    function messageWithCCTP(bytes memory payload) internal pure override returns (bool) {
-        (,, bool withCCTP) = _decodePayload(payload);
-
-        // NOTE: we are not checking _state.isUsingCCTP here in order to handle it as best effort
-        return withCCTP;
+    function _isTokenSend(HubSpokeStructs.Action action) internal pure returns (bool) {
+        return action == HubSpokeStructs.Action.Deposit || action == HubSpokeStructs.Action.Repay || action == HubSpokeStructs.Action.DepositNative || action == HubSpokeStructs.Action.RepayNative;
     }
 
-    function receiveWormholeMessages(
-          bytes memory payload,
-          bytes[] memory additionalVaas,
-          bytes32 sourceAddress,
-          uint16 sourceChain,
-          bytes32 deliveryHash
-    ) public virtual override(TokenReceiverWithCCTP) payable {
-        if (additionalVaas.length == 0) {
-            (address recipient,,) = _decodePayload(payload);
-            // send any refund back to the recipient
-            if (msg.value > 0) {
-                (bool refundSuccess,) = recipient.call{value: msg.value}("");
-                require(refundSuccess, "refund failed");
-            }
-        } else {
-            super.receiveWormholeMessages(payload, additionalVaas, sourceAddress, sourceChain, deliveryHash);
+    function releaseFunds(
+        IWormholeTunnel.MessageSource calldata source,
+        IERC20,
+        uint256,
+        bytes calldata payload
+    ) external payable onlyWormholeTunnel onlyHubSender(source) {
+        SpokeOptimisticFinalityLogic.handleReleaseFunds(ofState, weth, payload);
+    }
+
+    function topUp(
+        IWormholeTunnel.MessageSource calldata source,
+        IERC20 token,
+        uint256 amount,
+        bytes calldata
+    ) external payable onlyWormholeTunnel onlyHubSender(source) {
+        SpokeOptimisticFinalityLogic.handleTopUp(ofState, commState, source, token, amount);
+    }
+
+    function confirmCredit(
+        IWormholeTunnel.MessageSource calldata source,
+        IERC20,
+        uint256,
+        bytes calldata payload
+    ) external payable onlyWormholeTunnel onlyHubSender(source) {
+        SpokeOptimisticFinalityLogic.handleConfirmCredit(ofState, payload);
+    }
+
+    function finalizeCredit(
+        IWormholeTunnel.MessageSource calldata source,
+        IERC20,
+        uint256,
+        bytes calldata payload
+    ) external payable onlyWormholeTunnel onlyHubSender(source) {
+        SpokeOptimisticFinalityLogic.handleFinalizeCredit(ofState, payload);
+    }
+
+    function fixLostCredit(IERC20 token, uint256 amount, bool fromReserves) external payable onlyOwner {
+        SpokeOptimisticFinalityLogic.handleFixLostCredit(ofState, commState, token, amount, fromReserves);
+    }
+
+    function refundCredit(address _user, uint256 _nonce) external onlyOwner {
+        SpokeOptimisticFinalityLogic.handleRefundCredit(ofState, _user, _nonce);
+    }
+
+    // last resort setter in case some unpredicted reverts happen and Spoke balances need to be corrected
+    function overrideBalances(address token, uint256 creditGiven, uint256 unlocksPending, uint256 deposits, uint256 creditLost) external onlyOwner {
+        HubSpokeStructs.SpokeBalances storage balance = ofState.tokenBalances[toWormholeFormat(token)];
+        balance.creditGiven = creditGiven;
+        balance.unlocksPending = unlocksPending;
+        balance.deposits = deposits;
+        balance.creditLost = creditLost;
+    }
+
+    function refundFailedDeposit(address _user, address _token, uint256 _amount) external onlyOwner {
+        HubSpokeStructs.SpokeBalances storage balance = ofState.tokenBalances[toWormholeFormat(_token)];
+        IERC20 tokenE20 = IERC20(_token);
+        if (balance.deposits < _amount || tokenE20.balanceOf(address(this)) < _amount) {
+            revert InsufficientFunds();
         }
+        balance.deposits -= _amount;
+        tokenE20.safeTransfer(_user, _amount);
+        emit SpokeRefundSent(_user, _token, _amount);
     }
 
     /**
-     * @dev Receives a payload and tokens, and processes them
-     * @param payload - the payload received
-     * @param receivedTokens - the tokens received
-     * @param sourceAddress - the source address of the tokens
-     * @param sourceChain - the source chain of the tokens
-     * @param deliveryHash - the delivery hash of the tokens
+     * @notice Pauses the contract
      */
-    function receivePayloadAndTokens(
-        bytes memory payload,
-        TokenReceived[] memory receivedTokens,
-        bytes32 sourceAddress,
-        uint16 sourceChain,
-        bytes32 deliveryHash
-    )
-        internal
-        override
-        onlyWormholeRelayer
-        isRegisteredSender(sourceChain, sourceAddress)
-        replayProtect(deliveryHash)
-    {
-        require(receivedTokens.length == 1, "Expecting one transfer");
-
-        TokenReceived memory receivedToken = receivedTokens[0];
-        (address recipient, bool unwrap,) = _decodePayload(payload);
-        if (unwrap) {
-            // unwrap and transfer to recipient
-            tokenBridge.WETH().withdraw(receivedToken.amount);
-            (bool withdrawSuccess,) = recipient.call{value: receivedToken.amount}("");
-            require(withdrawSuccess, "withdraw to native failed");
-        } else {
-            IERC20(receivedToken.tokenAddress).safeTransfer(recipient, receivedToken.amount);
-        }
-
-        // send any refund back to the recipient
-        if (msg.value > 0) {
-            (bool refundSuccess,) = recipient.call{value: msg.value}("");
-            require(refundSuccess, "refund failed");
-        }
+    function pause() external onlyOwner {
+        _pause();
     }
 
     /**
-     * @dev Receives a payload and USDC via CCTP
-     * @param userPayload - the payload received
-     * @param amountUSDCReceived - the amount of USDC received
-     * @param sourceAddress - the source address of the tokens
-     * @param sourceChain - the source chain of the tokens
-     * @param deliveryHash - the delivery hash of the tokens
+     * @notice Unpauses the contract
      */
-    function receivePayloadAndUSDC(
-        bytes memory userPayload,
-        uint256 amountUSDCReceived,
-        bytes32 sourceAddress,
-        uint16 sourceChain,
-        bytes32 deliveryHash
-    )
-        internal
-        override
-        onlyWormholeRelayer
-        isRegisteredSender(sourceChain, sourceAddress)
-        replayProtect(deliveryHash)
-    {
-        (address recipient,,) = abi.decode(userPayload, (address, bool, bool));
-
-        IERC20(USDC).safeTransfer(recipient, amountUSDCReceived);
-
-        // send any refund back to the recipient
-        if (msg.value > 0) {
-            (bool refundSuccess,) = recipient.call{value: msg.value}("");
-            require(refundSuccess, "refund failed");
-        }
-    }
-
-    /**
-     * @dev Decodes `payload` into expected arguments
-     * @param payload - the payload received
-     */
-    function _decodePayload(
-        bytes memory payload
-    ) internal pure returns (address recipient, bool unwrap, bool withCCTP) {
-        (, bytes memory userPayload) = abi.decode(payload, (uint256, bytes));
-        (recipient, unwrap, withCCTP) = abi.decode(userPayload, (address, bool, bool));
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     /**
@@ -536,8 +332,5 @@ contract Spoke is SpokeGetters, TokenSender, CCTPSender, TokenReceiverWithCCTP, 
      */
     fallback() external payable {}
 
-    /**
-     * @notice Function to receive ETH
-     */
     receive() external payable {}
 }

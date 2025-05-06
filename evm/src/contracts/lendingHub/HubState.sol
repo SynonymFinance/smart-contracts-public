@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
-import "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import "../../interfaces/ILiquidationCalculator.sol";
-import "../../interfaces/IHubPriceUtilities.sol";
-import "../../interfaces/IAssetRegistry.sol";
-import "../HubSpokeStructs.sol";
-import "../HubSpokeEvents.sol";
+import {ILiquidationCalculator} from "../../interfaces/ILiquidationCalculator.sol";
+import {IHubPriceUtilities} from "../../interfaces/IHubPriceUtilities.sol";
+import {IAssetRegistry} from "../../interfaces/IAssetRegistry.sol";
+import {IWormholeTunnel} from "../../interfaces/IWormholeTunnel.sol";
+import {IMoneyMarketRewardsDistributor} from "../../interfaces/rewards/IMoneyMarketRewardsDistributor.sol";
+import {HubSpokeStructs} from "../HubSpokeStructs.sol";
+import {HubSpokeEvents} from "../HubSpokeEvents.sol";
+import {HubStorage} from "./HubStorage.sol";
 
 /**
  * @title HubState
@@ -17,59 +19,54 @@ abstract contract HubState is OwnableUpgradeable, HubSpokeEvents {
 
     error InvalidPrecision();
 
-    HubSpokeStructs.HubState _state;
+    HubSpokeStructs.HubState _deprecated_state;
 
-    function getAssetInfo(address assetAddress) internal view virtual returns (IAssetRegistry.AssetInfo memory) {
-        return _state.assetRegistry.getAssetInfo(assetAddress);
-    }
-
-    function consistencyLevel() public view returns (uint8) {
-        return _state.consistencyLevel;
+    function getAssetInfo(bytes32 assetId) internal view virtual returns (IAssetRegistry.AssetInfo memory) {
+        return getAssetRegistry().getAssetInfo(assetId);
     }
 
     function getLiquidationCalculator() public view returns (ILiquidationCalculator) {
-        return _state.liquidationCalculator;
+        return HubStorage.getAuxilaryContracts().liquidationCalculator;
     }
 
     function getPriceUtilities() public view returns (IHubPriceUtilities) {
-        return _state.priceUtilities;
+        return HubStorage.getAuxilaryContracts().priceUtilities;
     }
 
     function getAssetRegistry() public view returns (IAssetRegistry) {
-        return _state.assetRegistry;
+        return HubStorage.getAuxilaryContracts().assetRegistry;
+    }
+
+    function getWormholeTunnel() public view returns (IWormholeTunnel) {
+        return HubStorage.getAuxilaryContracts().wormholeTunnel;
+    }
+
+    function getRewardDistributor() public view returns (IMoneyMarketRewardsDistributor) {
+        return HubStorage.getAuxilaryContracts().rewardDistributor;
     }
 
     function getLiquidationFeeAndPrecision() public view returns (uint256, uint256) {
-        return (_state.liquidationFee, _state.liquidationFeePrecision);
+        HubSpokeStructs.FeesLimitsAndPrecisionsState storage state = HubStorage.getFeesLimitsAndPrecisionsState();
+        return (state.liquidationFee, state.liquidationFeePrecision);
     }
 
-    function getIsUsingCCTP() public view returns (bool) {
-        return _state.isUsingCCTP;
+    function getLastActivityBlockTimestamp(bytes32 _assetId) public view returns (uint256) {
+        return HubStorage.getAssetState(_assetId).lastActivityBlockTimestamp;
     }
 
-    function getLastActivityBlockTimestamp(address assetAddress) public view returns (uint256) {
-        return _state.lastActivityBlockTimestamps[assetAddress];
-    }
-
-    function getInterestAccrualIndices(address assetAddress) public view returns (HubSpokeStructs.AccrualIndices memory) {
-        if (_state.indices[assetAddress].deposited == 0 || _state.indices[assetAddress].borrowed == 0) {
+    function getInterestAccrualIndices(bytes32 _assetId) public view returns (HubSpokeStructs.AccrualIndices memory) {
+        HubSpokeStructs.AccrualIndices memory indices = HubStorage.getAssetState(_assetId).indices;
+        if (indices.deposited == 0 || indices.borrowed == 0) {
             // seed with precision if not set
-            return HubSpokeStructs.AccrualIndices({deposited: getInterestAccrualIndexPrecision(), borrowed: getInterestAccrualIndexPrecision()});
+            uint256 precision = getInterestAccrualIndexPrecision();
+            return HubSpokeStructs.AccrualIndices({deposited: precision, borrowed: precision});
         }
 
-        return _state.indices[assetAddress];
+        return indices;
     }
 
     function getInterestAccrualIndexPrecision() public view returns (uint256) {
-        return _state.interestAccrualIndexPrecision;
-    }
-
-    function setLastActivityBlockTimestamp(address assetAddress, uint256 blockTimestamp) internal {
-        _state.lastActivityBlockTimestamps[assetAddress] = blockTimestamp;
-    }
-
-    function setInterestAccrualIndices(address assetAddress, HubSpokeStructs.AccrualIndices memory indices) internal {
-        _state.indices[assetAddress] = indices;
+        return HubStorage.getFeesLimitsAndPrecisionsState().interestAccrualIndexPrecision;
     }
 
     /**
@@ -77,7 +74,8 @@ abstract contract HubState is OwnableUpgradeable, HubSpokeEvents {
      * @param value: The new value for `defaultGasLimit`
      */
     function setDefaultGasLimit(uint256 value) public onlyOwner {
-        _state.defaultGasLimit = value;
+        HubSpokeStructs.FeesLimitsAndPrecisionsState storage state = HubStorage.getFeesLimitsAndPrecisionsState();
+        state.defaultGasLimit = value;
     }
 
     /**
@@ -85,7 +83,8 @@ abstract contract HubState is OwnableUpgradeable, HubSpokeEvents {
      * @param value: The new value for `refundGasLimit`
      */
     function setRefundGasLimit(uint256 value) public onlyOwner {
-        _state.refundGasLimit = value;
+        HubSpokeStructs.FeesLimitsAndPrecisionsState storage state = HubStorage.getFeesLimitsAndPrecisionsState();
+        state.refundGasLimit = value;
     }
 
     /**
@@ -96,8 +95,9 @@ abstract contract HubState is OwnableUpgradeable, HubSpokeEvents {
         if (_liquidationFee > _precision) {
             revert InvalidPrecision();
         }
-        _state.liquidationFee = _liquidationFee;
-        _state.liquidationFeePrecision = _precision;
+        HubSpokeStructs.FeesLimitsAndPrecisionsState storage state = HubStorage.getFeesLimitsAndPrecisionsState();
+        state.liquidationFee = _liquidationFee;
+        state.liquidationFeePrecision = _precision;
         emit SetLiquidationFee(_liquidationFee, _precision);
     }
 
@@ -106,14 +106,34 @@ abstract contract HubState is OwnableUpgradeable, HubSpokeEvents {
      * @param _calculator: The address of the liquidation calculator
      */
     function setLiquidationCalculator(address _calculator) external onlyOwner {
-        _state.liquidationCalculator = ILiquidationCalculator(_calculator);
+        HubSpokeStructs.AuxilaryContracts storage state = HubStorage.getAuxilaryContracts();
+        state.liquidationCalculator = ILiquidationCalculator(_calculator);
     }
 
     function setPriceUtilities(address _priceUtilities) external onlyOwner {
-        _state.priceUtilities = IHubPriceUtilities(_priceUtilities);
+        HubSpokeStructs.AuxilaryContracts storage state = HubStorage.getAuxilaryContracts();
+        state.priceUtilities = IHubPriceUtilities(_priceUtilities);
     }
 
-    function setAssetRegistry(address _assetRegistry) external onlyOwner {
-        _state.assetRegistry = IAssetRegistry(_assetRegistry);
+    function setAssetRegistry(address _assetRegistry) public onlyOwner {
+        HubSpokeStructs.AuxilaryContracts storage state = HubStorage.getAuxilaryContracts();
+        state.assetRegistry = IAssetRegistry(_assetRegistry);
+    }
+
+    function getSpokeBalances(
+        uint16 chainId,
+        bytes32 tokenHomeAddress
+    ) public view returns (HubSpokeStructs.HubSpokeBalances memory) {
+        return HubStorage.getSpokeState(chainId).balances[tokenHomeAddress];
+    }
+
+    function setWormholeTunnel(address _wormholeTunnel) public onlyOwner {
+        HubSpokeStructs.AuxilaryContracts storage state = HubStorage.getAuxilaryContracts();
+        state.wormholeTunnel = IWormholeTunnel(_wormholeTunnel);
+    }
+
+    function setRewardDistributor(address _distributor) external onlyOwner {
+        HubSpokeStructs.AuxilaryContracts storage state = HubStorage.getAuxilaryContracts();
+        state.rewardDistributor = IMoneyMarketRewardsDistributor(_distributor);
     }
 }

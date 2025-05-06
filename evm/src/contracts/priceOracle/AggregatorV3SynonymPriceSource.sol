@@ -8,16 +8,16 @@ import {BaseSynonymPriceSource} from "./BaseSynonymPriceSource.sol";
  * @title AggregatorV3SynonymPriceOracle
  */
 contract AggregatorV3SynonymPriceSource is BaseSynonymPriceSource {
-    mapping(address => AggregatorV3Interface) public aggregators;
+    mapping(bytes32 => AggregatorV3Interface) public aggregators;
 
     error NoZeroOrNegativePrices();
     error InvalidPriceSource();
 
-    event PriceSourceSet(address indexed asset, address aggregator);
+    event PriceSourceSet(bytes32 indexed asset, address aggregator);
 
     constructor(string memory _outputAsset) BaseSynonymPriceSource(_outputAsset) {}
 
-    function priceAvailable(address _asset) public view override returns (bool) {
+    function priceAvailable(bytes32 _asset) public view override returns (bool) {
         return address(aggregators[_asset]) != address(0);
     }
 
@@ -25,7 +25,7 @@ contract AggregatorV3SynonymPriceSource is BaseSynonymPriceSource {
      * @notice Gets the price for an asset from a given source
      * @param _asset The asset to get the price for
      */
-    function getPrice(address _asset, uint256 _maxAge) public view override returns (Price memory price) {
+    function getPrice(bytes32 _asset, uint256 _maxAge) public view override returns (Price memory price) {
         if (!priceAvailable(_asset)) {
             revert NoPriceForAsset();
         }
@@ -55,10 +55,10 @@ contract AggregatorV3SynonymPriceSource is BaseSynonymPriceSource {
      * @param _aggregator The chainlink aggregator of the price feed
      */
     function setPriceSource(
-        address _asset,
+        bytes32 _asset,
         AggregatorV3Interface _aggregator
     ) external onlyOwner {
-        if (address(_aggregator) == address(0) || _asset == address(0)) {
+        if (address(_aggregator) == address(0) || _asset == bytes32(0)) {
             revert InvalidPriceSource();
         }
         aggregators[_asset] = _aggregator;

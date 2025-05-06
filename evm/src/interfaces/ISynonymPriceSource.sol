@@ -12,7 +12,7 @@ interface ISynonymPriceSource {
         uint256 updatedAt;
     }
 
-    function getPrice(address _asset, uint256 _maxAge) external view returns (Price memory price);
-    function priceAvailable(address _asset) external view returns (bool);
+    function getPrice(bytes32 _asset, uint256 _maxAge) external view returns (Price memory price);
+    function priceAvailable(bytes32 _asset) external view returns (bool);
     function outputAsset() external view returns (string memory);
 }

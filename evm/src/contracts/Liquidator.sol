@@ -7,6 +7,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import "../interfaces/IHub.sol";
 import "../interfaces/ILiquidator.sol";
 import "../contracts/HubSpokeStructs.sol";
+import "@wormhole/Utils.sol";
 
 contract Liquidator is ILiquidator, Ownable {
     using SafeERC20 for IERC20;
@@ -42,6 +43,10 @@ contract Liquidator is ILiquidator, Ownable {
         emit LiquidatorStatusChanged(_liquidator, false);
     }
 
+    function confirmPairingRequest(uint16 _chainId, bytes32 _pairedAddress) external onlyOwner {
+        hub.confirmPairingRequest(_chainId, _pairedAddress);
+    }
+
     function withdraw(IERC20 _token, address _recipient, uint256 _amount) public virtual override onlyOwner {
         if (address(_token) == address(0) || _recipient == address(0)) {
             revert NoZeroAddress();
@@ -53,17 +58,8 @@ contract Liquidator is ILiquidator, Ownable {
         emit Withdraw(_token, _recipient, _amount);
     }
 
-    function withdrawHubDeposit(IERC20 _token, address _recipient, uint256 _amount) external virtual override onlyOwner {
-        if (address(_token) == address(0) || _recipient == address(0)) {
-            revert NoZeroAddress();
-        }
-        uint256 balanceBefore = _token.balanceOf(address(this));
-        hub.userActions(HubSpokeStructs.Action.Withdraw, address(_token), _amount);
-        if (_token.balanceOf(address(this)) != balanceBefore + _amount) {
-            revert FailedHubWithdrawal();
-        }
-        _token.safeTransfer(_recipient, _amount);
-        emit Withdraw(_token, _recipient, _amount);
+    function withdrawHubDeposit(bytes32 _asset, uint256 _amount) external virtual override onlyOwner {
+        hub.userActions(HubSpokeStructs.Action.Withdraw, _asset, _amount);
     }
 
     function liquidation(ILiquidationCalculator.LiquidationInput memory input) public virtual override onlyLiquidator {
@@ -71,12 +67,32 @@ contract Liquidator is ILiquidator, Ownable {
     }
 
     function _liquidation(ILiquidationCalculator.LiquidationInput memory input) internal {
+        uint16 hubChainId = hub.getWormholeTunnel().chainId();
+        uint256 valueOfRepays = 0;
+        uint256 valueOfReceives = 0;
+        IHubPriceUtilities hpu = hub.getPriceUtilities();
         for (uint256 i = 0; i < input.assets.length; i++) {
             ILiquidationCalculator.DenormalizedLiquidationAsset memory asset = input.assets[i];
-            if (asset.repaidAmount > 0) {
-                IERC20(asset.assetAddress).approve(address(hub), asset.repaidAmount);
+            if (asset.repaidAmount > 0 && asset.repaymentMethod == ILiquidationCalculator.RepaymentMethod.TOKEN_TRANSFER) {
+                IAssetRegistry assetRegistry = hub.getAssetRegistry();
+                address hubChainAssetAddress = fromWormholeFormat(assetRegistry.getAssetAddress(asset.assetId, hubChainId));
+                if (hubChainAssetAddress == address(0)) {
+                    revert AssetNotOnHubChain();
+                }
+                IERC20(hubChainAssetAddress).approve(address(hub), asset.repaidAmount);
             }
+            HubSpokeStructs.NotionalVaultAmount memory valueOfAsset = hpu.calculateNotionals(
+                asset.assetId,
+                HubSpokeStructs.DenormalizedVaultAmount(asset.receivedAmount, asset.repaidAmount)
+            );
+            valueOfReceives += valueOfAsset.deposited;
+            valueOfRepays += valueOfAsset.borrowed;
         }
+
+        if (valueOfReceives < valueOfRepays) {
+            revert UnprofitableLiquidation();
+        }
+
         hub.liquidation(input);
     }
 }

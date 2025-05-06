@@ -7,7 +7,6 @@ import {ISynonymPriceOracle} from "../../interfaces/ISynonymPriceOracle.sol";
 import "../../interfaces/IHub.sol";
 import "../../interfaces/IHubPriceUtilities.sol";
 import "../HubSpokeStructs.sol";
-import "../wormhole/TokenBridgeUtilities.sol";
 
 /**
  * @title HubPriceUtilities
@@ -22,11 +21,6 @@ contract HubPriceUtilities is IHubPriceUtilities, Ownable {
     uint256 priceStandardDeviations;
     uint256 priceStandardDeviationsPrecision;
 
-    string public constant ERROR_DEPOSIT_LIMIT_EXCEEDED = "DepositLimitExceeded";
-    string public constant ERROR_VAULT_UNDER_COLLAT = "VaultUnderCollateralized";
-    string public constant ERROR_VAULT_INSUFFICIENT_BORROWS = "VaultInsufficientBorrows";
-
-    error DepositLimitExceeded();
     error NoZeroOrNegativePrices();
 
     constructor(
@@ -47,8 +41,8 @@ contract HubPriceUtilities is IHubPriceUtilities, Ownable {
         return IAssetRegistry(hub.getAssetRegistry());
     }
 
-    function getAssetInfo(address asset) internal view returns (IAssetRegistry.AssetInfo memory) {
-        return getAssetRegistry().getAssetInfo(asset);
+    function getAssetInfo(bytes32 _id) internal view returns (IAssetRegistry.AssetInfo memory) {
+        return getAssetRegistry().getAssetInfo(_id);
     }
 
     /**
@@ -59,19 +53,19 @@ contract HubPriceUtilities is IHubPriceUtilities, Ownable {
      * These values are used as lower and upper bounds of the price when determining whether to allow
      * borrows and withdraws
      *
-     * @param assetAddress the address of the relevant asset
+     * @param assetId the ID of the relevant asset
      * @return truePrice - the price of the asset
      * @return priceCollateral - the price of the asset when used as collateral [true price reduced by c*stdev]
      * @return priceDebt - the price of the asset when used as debt [true price increased by c*stdev]
      * @return pricePrecision - the precision of the price
      */
-    function getPrices(address assetAddress)
+    function getPrices(bytes32 assetId)
         public
         view
         override
         returns (uint256 truePrice, uint256 priceCollateral, uint256 priceDebt, uint256 pricePrecision)
     {
-        (uint256 price, uint256 conf, uint256 _pricePrecision) = getOraclePrices(assetAddress);
+        (uint256 price, uint256 conf, uint256 _pricePrecision) = getOraclePrices(assetId);
         // use conservative (from protocol's perspective) prices for collateral (low) and debt (high)--see https://docs.pyth.network/consume-data/best-practices#confidence-intervals
         uint256 confidenceInterval = conf * priceStandardDeviations / priceStandardDeviationsPrecision;
 
@@ -87,12 +81,12 @@ contract HubPriceUtilities is IHubPriceUtilities, Ownable {
 
     /**
      * @dev Get the price, through Pyth, of the asset at address assetAddress
-     * @param assetAddress - The address of the relevant asset
+     * @param assetId - The ID of the relevant asset
      * @return The price (in USD) of the asset, from Pyth;
      * @return The confidence (in USD) of the asset's price
      */
-    function getOraclePrices(address assetAddress) internal view returns (uint256, uint256, uint256) {
-        ISynonymPriceOracle.Price memory oraclePrice = priceOracle.getPrice(assetAddress);
+    function getOraclePrices(bytes32 assetId) internal view returns (uint256, uint256, uint256) {
+        ISynonymPriceOracle.Price memory oraclePrice = priceOracle.getPrice(assetId);
         return (oraclePrice.price, oraclePrice.confidence, oraclePrice.precision);
     }
 
@@ -115,9 +109,9 @@ contract HubPriceUtilities is IHubPriceUtilities, Ownable {
         returns (HubSpokeStructs.NotionalVaultAmount memory)
     {
         HubSpokeStructs.NotionalVaultAmount memory totalNotionalValues = HubSpokeStructs.NotionalVaultAmount(0, 0);
-        address[] memory allowList = getAssetRegistry().getRegisteredAssets();
+        bytes32[] memory allowList = getAssetRegistry().getRegisteredAssets();
         for (uint256 i = 0; i < allowList.length;) {
-            address asset = allowList[i];
+            bytes32 asset = allowList[i];
             HubSpokeStructs.DenormalizedVaultAmount memory vaultAmount = hub.getVaultAmounts(vaultOwner, asset);
             HubSpokeStructs.NotionalVaultAmount memory notionalValues = calculateNotionals(asset, vaultAmount);
             if (collateralizationRatios) {
@@ -145,13 +139,13 @@ contract HubPriceUtilities is IHubPriceUtilities, Ownable {
      * @return VaultAmount - the notional amount deposited and borrowed
      */
     function calculateNotionals(
-        address asset,
+        bytes32 asset,
         HubSpokeStructs.DenormalizedVaultAmount memory vaultAmount
     ) public view override returns (HubSpokeStructs.NotionalVaultAmount memory) {
         IAssetRegistry assetRegistry = getAssetRegistry();
         IAssetRegistry.AssetInfo memory assetInfo = assetRegistry.getAssetInfo(asset);
         (,uint256 priceCollateral, uint256 priceDebt,) = getPrices(asset);
-        uint256 expVal = 10 ** (assetRegistry.getMaxDecimals() - assetInfo.decimals);
+        uint256 expVal = 10 ** (assetRegistry.PROTOCOL_MAX_DECIMALS() - assetInfo.decimals);
 
         return HubSpokeStructs.NotionalVaultAmount(
             vaultAmount.deposited * priceCollateral * expVal,
@@ -160,13 +154,13 @@ contract HubPriceUtilities is IHubPriceUtilities, Ownable {
     }
 
     function invertNotionals(
-        address asset,
+        bytes32 asset,
         HubSpokeStructs.NotionalVaultAmount memory realValues
     ) public view override returns (HubSpokeStructs.DenormalizedVaultAmount memory) {
         IAssetRegistry assetRegistry = getAssetRegistry();
         IAssetRegistry.AssetInfo memory assetInfo = assetRegistry.getAssetInfo(asset);
         (,uint256 priceCollateral, uint256 priceDebt,) = getPrices(asset);
-        uint256 expVal = 10 ** (assetRegistry.getMaxDecimals() - assetInfo.decimals);
+        uint256 expVal = 10 ** (assetRegistry.PROTOCOL_MAX_DECIMALS() - assetInfo.decimals);
 
         return HubSpokeStructs.DenormalizedVaultAmount(
             realValues.deposited / (priceCollateral * expVal),
@@ -174,184 +168,26 @@ contract HubPriceUtilities is IHubPriceUtilities, Ownable {
         );
     }
 
-    function applyCollateralizationRatios(address asset, HubSpokeStructs.NotionalVaultAmount memory vaultAmount) public view override returns (HubSpokeStructs.NotionalVaultAmount memory) {
+    function applyCollateralizationRatios(bytes32 asset, HubSpokeStructs.NotionalVaultAmount memory vaultAmount) public view override returns (HubSpokeStructs.NotionalVaultAmount memory) {
         IAssetRegistry assetRegistry = getAssetRegistry();
         IAssetRegistry.AssetInfo memory assetInfo = assetRegistry.getAssetInfo(asset);
-        uint256 collateralizationRatioPrecision = assetRegistry.getCollateralizationRatioPrecision();
+        uint256 collateralizationRatioPrecision = assetRegistry.COLLATERALIZATION_RATIO_PRECISION();
         vaultAmount.deposited = vaultAmount.deposited * collateralizationRatioPrecision / assetInfo.collateralizationRatioDeposit;
         vaultAmount.borrowed = vaultAmount.borrowed * assetInfo.collateralizationRatioBorrow / collateralizationRatioPrecision;
         return vaultAmount;
     }
 
-    function removeCollateralizationRatios(address asset, HubSpokeStructs.NotionalVaultAmount memory vaultAmount) public view override returns (HubSpokeStructs.NotionalVaultAmount memory) {
+    function removeCollateralizationRatios(bytes32 asset, HubSpokeStructs.NotionalVaultAmount memory vaultAmount) public view override returns (HubSpokeStructs.NotionalVaultAmount memory) {
         IAssetRegistry assetRegistry = getAssetRegistry();
         IAssetRegistry.AssetInfo memory assetInfo = assetRegistry.getAssetInfo(asset);
-        uint256 collateralizationRatioPrecision = assetRegistry.getCollateralizationRatioPrecision();
+        uint256 collateralizationRatioPrecision = assetRegistry.COLLATERALIZATION_RATIO_PRECISION();
         vaultAmount.deposited = vaultAmount.deposited * assetInfo.collateralizationRatioDeposit / collateralizationRatioPrecision;
         vaultAmount.borrowed = vaultAmount.borrowed * collateralizationRatioPrecision / assetInfo.collateralizationRatioBorrow;
         return vaultAmount;
     }
 
-    function calculateEffectiveNotionals(address asset, HubSpokeStructs.DenormalizedVaultAmount memory vaultAmount) public view override returns (HubSpokeStructs.NotionalVaultAmount memory) {
+    function calculateEffectiveNotionals(bytes32 asset, HubSpokeStructs.DenormalizedVaultAmount memory vaultAmount) public view override returns (HubSpokeStructs.NotionalVaultAmount memory) {
         return applyCollateralizationRatios(asset, calculateNotionals(asset, vaultAmount));
-    }
-
-    /**
-     * @dev Check if a deposit of a certain amount of a certain asset is allowed
-     *
-     * @param assetAddress - The address of the relevant asset
-     * @param assetAmount - The amount of the relevant asset
-     * @param shouldRevert - Whether we should revert or simply log the error
-     * Only returns if this deposit does not exceed the deposit limit for the asset
-     * @return success - Whether the deposit is allowed
-     * @return error - The error message if the deposit is not allowed
-     */
-    function checkAllowedToDeposit(address assetAddress, uint256 assetAmount, bool shouldRevert)
-        external
-        view
-        override
-        returns (bool success, string memory error)
-    {
-        IAssetRegistry.AssetInfo memory assetInfo = getAssetInfo(assetAddress);
-        if (assetInfo.supplyLimit < type(uint256).max) {
-            HubSpokeStructs.DenormalizedVaultAmount memory globalAmounts = hub.getGlobalAmounts(assetAddress);
-
-            if (globalAmounts.deposited + assetAmount > assetInfo.supplyLimit) {
-                if (shouldRevert) {
-                    revert DepositLimitExceeded();
-                }
-                return (false, ERROR_DEPOSIT_LIMIT_EXCEEDED);
-            }
-        }
-
-        return (true, error);
-    }
-
-    /**
-     * @dev Check if vaultOwner is allowed to withdraw assetAmount of assetAddress from their vault
-     *
-     * @param vaultOwner - The address of the owner of the vault
-     * @param assetAddress - The address of the relevant asset
-     * @param assetAmount - The amount of the relevant asset
-     * @param shouldRevert - Whether we should revert or simply log the error
-     * Only returns if this withdrawal keeps the vault at a nonnegative notional value (worth >= $0 according to Pyth prices)
-     * (where the deposit values are divided by the deposit collateralization ratio and the borrow values are multiplied by the borrow collateralization ratio)
-     * and also if there is enough asset in the vault to complete the withdrawal
-     * and also if there is enough asset in the total reserve of the protocol to complete the withdrawal
-     * @return success - Whether the vault owner is allowed to withdraw
-     * @return error - The error message if the vault owner is not allowed to withdraw
-     */
-    function checkAllowedToWithdraw(address vaultOwner, address assetAddress, uint256 assetAmount, bool shouldRevert)
-        external
-        view
-        override
-        returns (bool success, string memory error)
-    {
-        (success, error) = hub.checkVaultHasAssets(vaultOwner, assetAddress, assetAmount, shouldRevert);
-
-        if (success) {
-            // checkProtocolGloballyHasAssets internally assumes the amount is denormalized
-            (success, error) =
-                hub.checkProtocolGloballyHasAssets(assetAddress, assetAmount, shouldRevert);
-        }
-
-        if (success) {
-            HubSpokeStructs.NotionalVaultAmount memory effectiveValue = calculateEffectiveNotionals(
-                assetAddress,
-                HubSpokeStructs.DenormalizedVaultAmount(assetAmount, 0)
-            );
-            HubSpokeStructs.NotionalVaultAmount memory notionals = getVaultEffectiveNotionals(vaultOwner, true);
-
-            bool overCollat = notionals.deposited >= notionals.borrowed + effectiveValue.deposited;
-
-            if (shouldRevert) {
-                require(overCollat, ERROR_VAULT_UNDER_COLLAT);
-            }
-
-            return (overCollat, ERROR_VAULT_UNDER_COLLAT);
-        }
-    }
-
-    /**
-     * @dev Check if vaultOwner is allowed to borrow assetAmount of assetAddress from their vault
-     *
-     * @param vaultOwner - The address of the owner of the vault
-     * @param assetAddress - The address of the relevant asset
-     * @param assetAmount - The amount of the relevant asset
-     * @param shouldRevert - Whether we should revert or simply log the error
-     * Only returns (otherwise reverts) if this borrow keeps the vault at a nonnegative notional value (worth >= $0 according to Pyth prices)
-     * (where the deposit values are divided by the deposit collateralization ratio and the borrow values are multiplied by the borrow collateralization ratio)
-     * and also if there is enough asset in the total reserve of the protocol to complete the borrow
-     * @return success - Whether the vault owner is allowed to borrow
-     * @return error - The error message if the vault owner is not allowed to borrow
-     */
-    function checkAllowedToBorrow(address vaultOwner, address assetAddress, uint256 assetAmount, bool shouldRevert)
-        external
-        view
-        override
-        returns (bool success, string memory error)
-    {
-        IAssetRegistry.AssetInfo memory assetInfo = getAssetInfo(assetAddress);
-
-        HubSpokeStructs.NotionalVaultAmount memory notionals = getVaultEffectiveNotionals(vaultOwner, true);
-
-        (success, error) = hub.checkProtocolGloballyHasAssets(
-            assetAddress, assetAmount, shouldRevert, assetInfo.borrowLimit
-        );
-
-        if (success) {
-            HubSpokeStructs.NotionalVaultAmount memory effectiveValue = calculateEffectiveNotionals(
-                assetAddress,
-                HubSpokeStructs.DenormalizedVaultAmount(0, assetAmount)
-            );
-            bool overCollat = notionals.deposited >= notionals.borrowed + effectiveValue.borrowed;
-
-            if (shouldRevert) {
-                require(overCollat, ERROR_VAULT_UNDER_COLLAT);
-            }
-
-            return (overCollat, ERROR_VAULT_UNDER_COLLAT);
-        }
-    }
-
-    /**
-     * @dev Check if vaultOwner is allowed to repay assetAmount of assetAddress to their vault;
-     * they must have outstanding borrows of at least assetAmount for assetAddress to enable repayment
-     * @param vaultOwner - The address of the owner of the vault
-     * @param assetAddress - The address of the relevant asset
-     * @param assetAmount - The amount of the relevant asset
-     * @param shouldRevert - Whether we should revert or simply log the error
-     * @return success - Whether the vault owner is allowed to repay
-     * @return error - The error message if the vault owner is not allowed to repay
-     */
-    function checkAllowedToRepay(address vaultOwner, address assetAddress, uint256 assetAmount, bool shouldRevert)
-        external
-        view
-        override
-        returns (bool success, string memory error)
-    {
-        HubSpokeStructs.DenormalizedVaultAmount memory vaultAmount = hub.getVaultAmounts(vaultOwner, assetAddress);
-        IAssetRegistry.AssetInfo memory assetInfo = getAssetInfo(assetAddress);
-
-        bool allowed;
-        if (shouldRevert || assetInfo.decimals <= TokenBridgeUtilities.MAX_DECIMALS) {
-            // this is a same chain operation or the bridged token has less decimals than the bridge
-            // there can be no dust truncation here
-            // require that the debt is strictly greater or equal to the amount being repaid
-            allowed = vaultAmount.borrowed >= assetAmount;
-        } else {
-            // This is a cross-chain operation and Wormhole truncates the sent token to 8 decimals, so we allow for slight overpaying of the debt (by up to 1e-8)
-            // This allows vault owner to always be able to fully repay outstanding borrows.
-            uint256 allowedRepay = TokenBridgeUtilities.trimDust(vaultAmount.borrowed, assetInfo.decimals);
-            allowedRepay += 10 ** (assetInfo.decimals - TokenBridgeUtilities.MAX_DECIMALS);
-            allowed = allowedRepay >= assetAmount;
-        }
-
-        if (shouldRevert) {
-            require(allowed, ERROR_VAULT_INSUFFICIENT_BORROWS);
-        }
-
-        return (allowed, ERROR_VAULT_INSUFFICIENT_BORROWS);
     }
 
     // Getter for hub
