@@ -6,53 +6,55 @@ import "../contracts/HubSpokeStructs.sol";
 import "./ILiquidationCalculator.sol";
 import "./IHubPriceUtilities.sol";
 import "./IAssetRegistry.sol";
+import {IWormholeTunnel} from "./IWormholeTunnel.sol";
 
 /**
  * @notice interface for external contracts that need to access Hub state
  */
 interface IHub {
-    function checkVaultHasAssets(address vault, address assetAddress, uint256 normalizedAmount, bool shouldRevert)
+    function checkVaultHasAssets(address vault, bytes32 assetId, uint256 normalizedAmount)
         external
-        view
-        returns (bool success, string memory error);
+        view;
 
     function checkProtocolGloballyHasAssets(
-        address assetAddress,
-        uint256 normalizedAmount,
-        bool shouldRevert
-    ) external view returns (bool success, string memory error);
+        bytes32 assetId,
+        uint256 normalizedAmount
+    ) external view;
 
     function checkProtocolGloballyHasAssets(
-        address assetAddress,
+        bytes32 assetId,
         uint256 normalizedAmount,
-        bool shouldRevert,
         uint256 borrowLimit
-    ) external view returns (bool success, string memory error);
+    ) external view;
 
-    function getInterestAccrualIndices(address assetAddress)
+    function getInterestAccrualIndices(bytes32 assetId)
         external
         view
         returns (HubSpokeStructs.AccrualIndices memory);
 
     function getInterestAccrualIndexPrecision() external view returns (uint256);
 
-    function getVaultAmounts(address vaultOwner, address assetAddress)
+    function getVaultAmounts(address vaultOwner, bytes32 assetId)
         external
         view
         returns (HubSpokeStructs.DenormalizedVaultAmount memory);
 
-    function getCurrentAccrualIndices(address assetAddress)
+    function getCurrentAccrualIndices(bytes32 assetId)
         external
         view
         returns (HubSpokeStructs.AccrualIndices memory);
 
-    function updateAccrualIndices(address assetAddress) external;
+    function updateAccrualIndices(bytes32 assetId) external;
 
-    function getLastActivityBlockTimestamp(address assetAddress) external view returns (uint256);
+    function getLastActivityBlockTimestamp(bytes32 assetId) external view returns (uint256);
 
-    function getGlobalAmounts(address assetAddress) external view returns (HubSpokeStructs.DenormalizedVaultAmount memory);
+    function getGlobalAmounts(bytes32 assetId) external view returns (HubSpokeStructs.DenormalizedVaultAmount memory);
 
-    function getReserveAmount(address assetAddress) external view returns (uint256);
+    function getReserveAmount(bytes32 assetId) external view returns (uint256);
+
+    function getSpokeBalances(uint16 chainId, bytes32 homeAddress) external view returns (HubSpokeStructs.HubSpokeBalances memory);
+
+    function getSpokeBalances(bytes32 assetId) external view returns (HubSpokeStructs.HubSpokeBalances memory);
 
     function getLiquidationCalculator() external view returns (ILiquidationCalculator);
 
@@ -60,9 +62,57 @@ interface IHub {
 
     function getAssetRegistry() external view returns (IAssetRegistry);
 
+    function getWormholeTunnel() external view returns (IWormholeTunnel);
+
     function getLiquidationFeeAndPrecision() external view returns (uint256, uint256);
 
     function liquidation(ILiquidationCalculator.LiquidationInput memory input) external;
 
-    function userActions(HubSpokeStructs.Action action, address asset, uint256 amount) external payable;
+    function userActions(HubSpokeStructs.Action action, bytes32 asset, uint256 amount) external payable;
+
+    function confirmPairingRequest(uint16 _chainId, bytes32 _account) external;
+
+    // ----- cross chain message handlers ---
+
+    function userActionMessage(
+        IWormholeTunnel.MessageSource calldata source,
+        IERC20 token,
+        uint256 amount,
+        bytes calldata payload
+    ) external payable;
+
+    function instantActionMessage(
+        IWormholeTunnel.MessageSource calldata source,
+        IERC20 token,
+        uint256 amount,
+        bytes calldata payload
+    ) external;
+
+    function finalizeCreditMessage(
+        IWormholeTunnel.MessageSource calldata source,
+        IERC20 token,
+        uint256 amount,
+        bytes calldata payload
+    ) external;
+
+    function confirmTopUpMessage(
+        IWormholeTunnel.MessageSource calldata source,
+        IERC20 token,
+        uint256 amount,
+        bytes calldata payload
+    ) external;
+
+    function confirmFixLostCreditMessage(
+        IWormholeTunnel.MessageSource calldata source,
+        IERC20 token,
+        uint256 amount,
+        bytes calldata payload
+    ) external;
+
+    function pairingRequestMessage(
+        IWormholeTunnel.MessageSource calldata source,
+        IERC20 token,
+        uint256 amount,
+        bytes calldata payload
+    ) external;
 }

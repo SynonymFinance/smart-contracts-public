@@ -41,6 +41,10 @@ contract PiecewiseInterestRate is BaseInterestRate {
 
     // VIEW FUNCTIONS
 
+    function getModel() public view returns (PiecewiseInterestRateModel memory) {
+        return model;
+    }
+
     function getInterestRateFromPoolUtilization(HubSpokeStructs.DenormalizedVaultAmount memory _globalAssetAmount) public view override returns (InterestRateBase memory baseRate) {
         // this doesn't change
         baseRate.precision = model.ratePrecision;

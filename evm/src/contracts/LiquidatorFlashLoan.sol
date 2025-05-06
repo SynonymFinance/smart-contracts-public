@@ -6,8 +6,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IFlashLoanReceiver, IPool, IPoolAddressesProvider} from "@aave/core-v3/contracts/flashloan/interfaces/IFlashLoanReceiver.sol";
 import {ISwapRouter} from "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
 import {SwapAmountsOracle} from "../../src/libraries/SwapAmountsOracle.sol";
-import {IHub, ILiquidationCalculator, Liquidator} from "./Liquidator.sol";
+import {IHub, ILiquidationCalculator, Liquidator, IAssetRegistry, IWormholeTunnel} from "./Liquidator.sol";
 import {ISynonymPriceOracle} from "../interfaces/ISynonymPriceOracle.sol";
+import { IERC20decimals } from "../interfaces/IERC20decimals.sol";
+import "@wormhole/Utils.sol";
 
 
 contract LiquidatorFlashLoan is IFlashLoanReceiver, Liquidator {
@@ -16,9 +18,11 @@ contract LiquidatorFlashLoan is IFlashLoanReceiver, Liquidator {
 
     error NotImplemented();
     error NoDepositTakeover();
+    error UnsupportedAsset();
 
     struct SwapRepayData {
-        address asset;
+        bytes32 asset;
+        address hubChainAddress;
         uint256 need;
         uint256 have;
     }
@@ -33,6 +37,9 @@ contract LiquidatorFlashLoan is IFlashLoanReceiver, Liquidator {
     ISwapRouter public immutable UNISWAP_ROUTER;
     ISynonymPriceOracle public immutable PRICE_ORACLE;
     IERC20 public immutable PROFIT_TOKEN;
+    bytes32 public immutable PROFIT_TOKEN_ASSET_ID;
+    uint8 public immutable PROFIT_TOKEN_DECIMALS;
+    uint16 public immutable HUB_CHAIN_ID;
     address public profitReceiver;
     uint256 public maxSlippage;
 
@@ -55,6 +62,9 @@ contract LiquidatorFlashLoan is IFlashLoanReceiver, Liquidator {
         UNISWAP_ROUTER = _uniswapRouter;
         PRICE_ORACLE = _synonymPriceOracle;
         PROFIT_TOKEN = _profitToken;
+        PROFIT_TOKEN_DECIMALS = IERC20decimals(address(PROFIT_TOKEN)).decimals();
+        HUB_CHAIN_ID = hub.getWormholeTunnel().chainId();
+        PROFIT_TOKEN_ASSET_ID = hub.getAssetRegistry().getAssetId(HUB_CHAIN_ID, toWormholeFormat(address(PROFIT_TOKEN)));
         setProfitReceiver(_profitReceiver);
         setMaxSlippage(_maxSlippage);
 
@@ -80,7 +90,7 @@ contract LiquidatorFlashLoan is IFlashLoanReceiver, Liquidator {
         poolFee = _poolFee;
     }
 
-    function withdrawHubDeposit(IERC20, address, uint256) external pure override {
+    function withdrawHubDeposit(bytes32, uint256) external pure override {
         revert NotImplemented();
     }
 
@@ -91,17 +101,24 @@ contract LiquidatorFlashLoan is IFlashLoanReceiver, Liquidator {
                 nonZeroRepays++;
             }
 
-            if (input.assets[i].depositTakeover) {
+            if (input.assets[i].paymentMethod == ILiquidationCalculator.PaymentMethod.DEPOSIT_TAKEOVER) {
                 revert NoDepositTakeover();
             }
         }
+
+        IAssetRegistry assetRegistry = hub.getAssetRegistry();
+
         address[] memory flashLoanAssets = new address[](nonZeroRepays);
         uint256[] memory flashLoanAmounts = new uint256[](nonZeroRepays);
         uint256 flashLoanIndex = 0;
         for (uint256 i = 0; i < input.assets.length; i++) {
             ILiquidationCalculator.DenormalizedLiquidationAsset memory asset = input.assets[i];
             if (asset.repaidAmount > 0) {
-                flashLoanAssets[flashLoanIndex] = asset.assetAddress;
+                address hubChainAssetAddress = fromWormholeFormat(assetRegistry.getAssetAddress(asset.assetId, HUB_CHAIN_ID));
+                if (hubChainAssetAddress == address(0)) {
+                    revert UnsupportedAsset();
+                }
+                flashLoanAssets[flashLoanIndex] = hubChainAssetAddress;
                 flashLoanAmounts[flashLoanIndex] = asset.repaidAmount;
                 flashLoanIndex++;
             }
@@ -145,14 +162,16 @@ contract LiquidatorFlashLoan is IFlashLoanReceiver, Liquidator {
         // liquidate as usual
         _liquidation(input);
 
+        IAssetRegistry assetRegistry = hub.getAssetRegistry();
+
         SwapRepayData[] memory swapRepayData = new SwapRepayData[](input.assets.length);
         for (uint256 i = 0; i < input.assets.length; i++) {
-            IERC20 assetIERC20 = IERC20(input.assets[i].assetAddress);
-            swapRepayData[i].asset = input.assets[i].assetAddress;
-            swapRepayData[i].have = assetIERC20.balanceOf(address(this));
+            swapRepayData[i].asset = input.assets[i].assetId;
+            swapRepayData[i].hubChainAddress = fromWormholeFormat(assetRegistry.getAssetAddress(input.assets[i].assetId, HUB_CHAIN_ID));
+            swapRepayData[i].have = IERC20(swapRepayData[i].hubChainAddress).balanceOf(address(this));
 
             for (uint256 assetFlIdx = 0; assetFlIdx < assets.length; assetFlIdx++) {
-                if (assets[assetFlIdx] == input.assets[i].assetAddress) {
+                if (assets[assetFlIdx] == swapRepayData[i].hubChainAddress) {
                     swapRepayData[i].need = amounts[assetFlIdx] + premiums[assetFlIdx];
                     break;
                 }
@@ -160,15 +179,21 @@ contract LiquidatorFlashLoan is IFlashLoanReceiver, Liquidator {
 
             // no point in selling excess WETH for WETH
             // otherwise sell all excess to WETH
-            if (swapRepayData[i].asset != address(PROFIT_TOKEN) && swapRepayData[i].have > swapRepayData[i].need) {
+            if (swapRepayData[i].hubChainAddress != address(PROFIT_TOKEN) && swapRepayData[i].have > swapRepayData[i].need) {
                 // swap the excess into WETH
                 uint256 excess = swapRepayData[i].have - swapRepayData[i].need;
-                assetIERC20.forceApprove(address(UNISWAP_ROUTER), excess);
-                uint256 fairAmountOut = PRICE_ORACLE.getOutputForInput(swapRepayData[i].asset, address(PROFIT_TOKEN), excess);
+                IERC20(swapRepayData[i].hubChainAddress).forceApprove(address(UNISWAP_ROUTER), excess);
+                uint256 fairAmountOut = PRICE_ORACLE.getOutputForInput(
+                    input.assets[i].assetId,
+                    IERC20decimals(swapRepayData[i].hubChainAddress).decimals(),
+                    PROFIT_TOKEN_ASSET_ID,
+                    PROFIT_TOKEN_DECIMALS,
+                    excess
+                );
                 uint256 minAmountOut = fairAmountOut * (MAX_SLIPPAGE_PRECISION - maxSlippage) / MAX_SLIPPAGE_PRECISION;
 
                 ISwapRouter.ExactInputSingleParams memory swapParams = ISwapRouter.ExactInputSingleParams({
-                    tokenIn: swapRepayData[i].asset,
+                    tokenIn: swapRepayData[i].hubChainAddress,
                     tokenOut: address(PROFIT_TOKEN),
                     fee: poolFee,
                     recipient: address(this),
@@ -185,20 +210,26 @@ contract LiquidatorFlashLoan is IFlashLoanReceiver, Liquidator {
 
             if (swapRepayData[i].need > 0) {
                 // approve the returned amount to the pool
-                assetIERC20.forceApprove(address(POOL), swapRepayData[i].need);
+                IERC20(swapRepayData[i].hubChainAddress).forceApprove(address(POOL), swapRepayData[i].need);
             }
         }
 
         for (uint256 i = 0; i < swapRepayData.length; i++) {
             // WETH is already there. no point to buy it
-            if (swapRepayData[i].asset != address(PROFIT_TOKEN) && swapRepayData[i].have < swapRepayData[i].need) {
+            if (swapRepayData[i].hubChainAddress != address(PROFIT_TOKEN) && swapRepayData[i].have < swapRepayData[i].need) {
                 uint256 deficit = swapRepayData[i].need - swapRepayData[i].have;
-                uint256 fairAmountIn = PRICE_ORACLE.getInputForOutput(address(PROFIT_TOKEN), swapRepayData[i].asset, deficit);
+                uint256 fairAmountIn = PRICE_ORACLE.getInputForOutput(
+                    PROFIT_TOKEN_ASSET_ID,
+                    PROFIT_TOKEN_DECIMALS,
+                    swapRepayData[i].asset,
+                    IERC20decimals(swapRepayData[i].hubChainAddress).decimals(),
+                    deficit
+                );
                 uint256 maxAmountIn = fairAmountIn * (MAX_SLIPPAGE_PRECISION + maxSlippage) / MAX_SLIPPAGE_PRECISION;
 
                 ISwapRouter.ExactOutputSingleParams memory swapParams = ISwapRouter.ExactOutputSingleParams({
                     tokenIn: address(PROFIT_TOKEN),
-                    tokenOut: swapRepayData[i].asset,
+                    tokenOut: swapRepayData[i].hubChainAddress,
                     fee: poolFee,
                     recipient: address(this),
                     deadline: block.timestamp,

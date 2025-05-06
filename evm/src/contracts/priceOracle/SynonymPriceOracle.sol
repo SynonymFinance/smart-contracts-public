@@ -8,7 +8,7 @@ import {ISynonymPriceOracle, ISynonymPriceSource, AggregatorV3Interface} from ".
  * @title SynonymPriceOracle
  */
 contract SynonymPriceOracle is ISynonymPriceOracle, BaseSynonymPriceSource {
-    mapping(address => PriceSource) public sources;
+    mapping(bytes32 => PriceSource) public sources;
     AggregatorV3Interface public override sequencerUptimeFeed;
     uint256 public override sequencerGracePeriod;
 
@@ -19,7 +19,7 @@ contract SynonymPriceOracle is ISynonymPriceOracle, BaseSynonymPriceSource {
     error InvalidGracePeriod();
     error SequencerDown();
 
-    event PriceSourceSet(address indexed asset, ISynonymPriceSource priceSource, uint256 maxPriceAge);
+    event PriceSourceSet(bytes32 indexed asset, ISynonymPriceSource priceSource, uint256 maxPriceAge);
     event SequencerUptimeFeedSet(address indexed sequencerUptimeFeed, uint256 gracePeriod);
 
     constructor(
@@ -31,15 +31,15 @@ contract SynonymPriceOracle is ISynonymPriceOracle, BaseSynonymPriceSource {
         sequencerGracePeriod = _sequencerGracePeriod;
     }
 
-    function priceAvailable(address _asset) public view override returns (bool) {
+    function priceAvailable(bytes32 _asset) public view override returns (bool) {
         return sources[_asset].priceSource != ISynonymPriceSource(address(0));
     }
 
-    function getPrice(address _asset) public view override returns (ISynonymPriceOracle.Price memory price) {
+    function getPrice(bytes32 _asset) public view override returns (ISynonymPriceOracle.Price memory price) {
         return getPrice(_asset, sources[_asset].maxPriceAge);
     }
 
-    function getPrice(address _asset, uint256 _maxAge) public view override returns (ISynonymPriceOracle.Price memory price) {
+    function getPrice(bytes32 _asset, uint256 _maxAge) public view override returns (ISynonymPriceOracle.Price memory price) {
         if (!priceAvailable(_asset)) {
             revert InvalidPriceSource();
         }
@@ -78,10 +78,10 @@ contract SynonymPriceOracle is ISynonymPriceOracle, BaseSynonymPriceSource {
     }
 
     function setPriceSource(
-        address _asset,
+        bytes32 _asset,
         PriceSource memory _priceSource
     ) external override onlyOwner {
-        if (_asset == address(0)) {
+        if (_asset == bytes32(0)) {
             revert InvalidAsset();
         }
         if (_priceSource.priceSource == ISynonymPriceSource(address(0))) {
@@ -98,7 +98,7 @@ contract SynonymPriceOracle is ISynonymPriceOracle, BaseSynonymPriceSource {
         emit PriceSourceSet(_asset, _priceSource.priceSource, _priceSource.maxPriceAge);
     }
 
-    function removePriceSource(address _asset) external onlyOwner {
+    function removePriceSource(bytes32 _asset) external onlyOwner {
         if (sources[_asset].priceSource == ISynonymPriceSource(address(0))) {
             revert InvalidPriceSource();
         }
@@ -106,7 +106,7 @@ contract SynonymPriceOracle is ISynonymPriceOracle, BaseSynonymPriceSource {
         emit PriceSourceSet(_asset, ISynonymPriceSource(address(0)), 0);
     }
 
-    function getPriceSource(address _asset) external view override returns (PriceSource memory) {
+    function getPriceSource(bytes32 _asset) external view override returns (PriceSource memory) {
         if (sources[_asset].priceSource == ISynonymPriceSource(address(0))) {
             revert InvalidAsset();
         }

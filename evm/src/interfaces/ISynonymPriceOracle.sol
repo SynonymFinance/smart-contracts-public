@@ -12,8 +12,8 @@ interface ISynonymPriceOracle is ISynonymPriceSource {
 
     function sequencerUptimeFeed() external view returns (AggregatorV3Interface);
     function sequencerGracePeriod() external view returns (uint256);
-    function getPrice(address _asset) external view returns (Price memory price);
-    function setPriceSource(address _asset, PriceSource memory _priceSource) external;
-    function removePriceSource(address _asset) external;
-    function getPriceSource(address _asset) external view returns (PriceSource memory);
+    function getPrice(bytes32 _asset) external view returns (Price memory price);
+    function setPriceSource(bytes32 _asset, PriceSource memory _priceSource) external;
+    function removePriceSource(bytes32 _asset) external;
+    function getPriceSource(bytes32 _asset) external view returns (PriceSource memory);
 }

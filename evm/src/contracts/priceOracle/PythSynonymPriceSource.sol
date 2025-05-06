@@ -10,14 +10,14 @@ import {BaseSynonymPriceSource} from "./BaseSynonymPriceSource.sol";
 contract PythSynonymPriceSource is BaseSynonymPriceSource {
     IPyth public pyth;
 
-    mapping(address => bytes32) public assetPythIds;
+    mapping(bytes32 => bytes32) public assetPythIds;
 
     error PythExpoExpectedToBeNegative();
     error NoZeroOrNegativePrices();
     error InvalidPriceSource();
 
     event PythSet(address indexed pyth);
-    event PriceSourceSet(address indexed asset, bytes32 pythId);
+    event PriceSourceSet(bytes32 indexed asset, bytes32 pythId);
 
     /**
      * @notice contract constructor
@@ -26,7 +26,7 @@ contract PythSynonymPriceSource is BaseSynonymPriceSource {
         setPyth(_pyth);
     }
 
-    function priceAvailable(address _asset) public view override returns (bool) {
+    function priceAvailable(bytes32 _asset) public view override returns (bool) {
         return assetPythIds[_asset] != bytes32(0);
     }
 
@@ -34,7 +34,7 @@ contract PythSynonymPriceSource is BaseSynonymPriceSource {
      * @notice Gets the price for an asset from a given source
      * @param _asset The asset to get the price for
      */
-    function getPrice(address _asset, uint256 _maxAge) public view override returns (Price memory price) {
+    function getPrice(bytes32 _asset, uint256 _maxAge) public view override returns (Price memory price) {
         if (!priceAvailable(_asset)) {
             revert NoPriceForAsset();
         }
@@ -75,10 +75,10 @@ contract PythSynonymPriceSource is BaseSynonymPriceSource {
      * @param _pythId The pythId of the price feed
      */
     function setPriceSource(
-        address _asset,
+        bytes32 _asset,
         bytes32 _pythId
     ) external onlyOwner {
-        if (_pythId == bytes32(0) || _asset == address(0)) {
+        if (_pythId == bytes32(0) || _asset == bytes32(0)) {
             revert InvalidPriceSource();
         }
         assetPythIds[_asset] = _pythId;

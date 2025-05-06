@@ -20,4 +20,8 @@ contract SYNO is ERC20Upgradeable {
 
         _mint(msg.sender, 800_000_000 ether);
     }
+
+    function burn(uint256 _amount) external {
+        _burn(msg.sender, _amount);
+    }
 }

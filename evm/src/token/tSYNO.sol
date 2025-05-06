@@ -5,8 +5,11 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {IBalancerQueries} from "@balancer-labs/v2-interfaces/contracts/standalone-utils/IBalancerQueries.sol";
 import {IrCT} from "./rCT.sol";
 import {ITokenConverter} from "./TokenConverter.sol";
+import {SynoBalancerPoolHelper, IBalancerPoolToken, IVault, IWETH} from "./SynoBalancerPoolHelper.sol";
+import {vlSYNO} from "./vlSyno.sol";
 
 /**
  * @title ItSYNO
@@ -22,6 +25,7 @@ interface ItSYNO {
  */
 contract tSYNO is ItSYNO, Initializable, OwnableUpgradeable {
     using SafeERC20 for IERC20;
+    using SynoBalancerPoolHelper for IBalancerPoolToken;
 
     string public constant name = "Staked SYNO";
     string public constant symbol = "tSYNO";
@@ -39,9 +43,14 @@ contract tSYNO is ItSYNO, Initializable, OwnableUpgradeable {
     uint256 public stakingPeriodStart;
     uint256 public stakingPeriodEnd;
 
+    vlSYNO public vlSyno;
+
     error InvalidInput();
     error OnlyTokenConverter();
     error InsufficientBalance();
+    error LockPeriodNotSupported();
+    error ETHTransferFailed();
+    error InsufficientETHAmount();
 
     event Transfer(address indexed from, address indexed to, uint256 amount);
 
@@ -67,7 +76,8 @@ contract tSYNO is ItSYNO, Initializable, OwnableUpgradeable {
         address _treasury,
         address _rCT,
         uint256 _stakingPeriodStart,
-        uint256 stakingPeriodLength
+        uint256 stakingPeriodLength,
+        address _vlSyno
     ) public initializer {
         OwnableUpgradeable.__Ownable_init(msg.sender);
 
@@ -77,12 +87,14 @@ contract tSYNO is ItSYNO, Initializable, OwnableUpgradeable {
             || _rCT == address(0)
             || _stakingPeriodStart == 0
             || stakingPeriodLength == 0
+            || _vlSyno == address(0)
         ) revert InvalidInput();
 
         treasury = _treasury;
         tokenConverter = ITokenConverter(_tokenConverter);
         SYNO = IERC20(_SYNO);
         rCT = IrCT(_rCT);
+        vlSyno = vlSYNO(_vlSyno);
 
         stakingPeriodStart = _stakingPeriodStart;
         stakingPeriodEnd = _stakingPeriodStart + stakingPeriodLength;
@@ -185,5 +197,57 @@ contract tSYNO is ItSYNO, Initializable, OwnableUpgradeable {
         rCT.burn(sender, rctToBurn);
 
         tokenConverter.updateBurned(sender, rctToBurn, tSYNOToBurnAlongWithRCTs);
+    }
+
+    /**
+     * @dev returns required amount of ETH to convert to vlSYNO
+     */
+    function getRequiredETHAmount() public view returns(uint256) {
+        uint256 tSynoAmount = balanceOf[msg.sender];
+        return IBalancerPoolToken(vlSyno.poolToken())._calculateRequiredETHAmount(tSynoAmount);
+    }
+
+    /**
+     * @dev converts tSYNO to vlSYNO
+     * @param lockPeriod lock in vlSYNO
+     */
+    function convertToVlSyno(vlSYNO.LockPeriod lockPeriod) external payable {
+        // 1. Check for acceptable lock periods
+        if(lockPeriod != vlSYNO.LockPeriod.SIX_MONTHS && lockPeriod != vlSYNO.LockPeriod.TWELVE_MONTHS) {
+            revert LockPeriodNotSupported();
+        }
+
+        IBalancerPoolToken poolToken = IBalancerPoolToken(vlSyno.poolToken());
+
+        uint256 tSynoAmount = balanceOf[msg.sender];
+
+        uint256 requiredETHAmount = getRequiredETHAmount();
+
+        // 2. Check if enough ETH was sent
+        if(msg.value < requiredETHAmount) {
+            revert InsufficientETHAmount();
+        }
+
+        // 3. Join Pool
+        uint256 balanceLPTokensDifference = poolToken._joinBalancerPool(tSynoAmount, requiredETHAmount);
+
+        // 4. Stake Tokens in VLSyno Pool
+        poolToken.approve(address(vlSyno), balanceLPTokensDifference);
+        vlSyno.stake(balanceLPTokensDifference, lockPeriod, msg.sender);
+
+        // 5. Reduce the tSYNO supply
+        balanceOf[msg.sender] -= tSynoAmount;
+        totalSupply -= tSynoAmount;
+        emit Transfer(msg.sender, address(0), tSynoAmount);
+
+        (bool success,) = payable(msg.sender).call{value: msg.value - requiredETHAmount}("");
+
+        if (!success) {
+            revert ETHTransferFailed();
+        }
+    }
+
+    function setVlSYNOAddress(address _vlSyno) public onlyOwner {
+        vlSyno = vlSYNO(_vlSyno);
     }
 }

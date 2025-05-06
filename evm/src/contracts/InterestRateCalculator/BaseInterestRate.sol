@@ -3,7 +3,7 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "../../interfaces/IInterestRateCalculator.sol";
-import "../../libraries/Interest.sol";
+import "../../libraries/logic/InterestLogic.sol";
 
 /**
  * @title LinearInterestRate
@@ -28,7 +28,7 @@ abstract contract BaseInterestRate is IInterestRateCalculator, Ownable {
       }
 
       InterestRates memory rates = currentInterestRate(globalAssetAmount);
-      HubSpokeStructs.AccrualIndices memory accrualIndices = Interest.computeAccrualIndices(rates, secondsElapsed, interestAccrualIndexPrecision);
+      HubSpokeStructs.AccrualIndices memory accrualIndices = InterestLogic.computeAccrualIndices(rates, secondsElapsed, interestAccrualIndexPrecision);
       depositInterestFactor = accrualIndices.deposited;
       borrowInterestFactor = accrualIndices.borrowed;
       precision = interestAccrualIndexPrecision;
